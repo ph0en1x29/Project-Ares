@@ -1,6 +1,6 @@
-# Entry Signal Model
+# Project Ares
 
-**Live tech stock entry signal scoring engine** — multi-factor model with real-time data.
+**Live tech stock entry signal scoring engine (Project Ares)** — multi-factor model with real-time data.
 
 ## What It Does
 
