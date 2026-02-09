@@ -860,12 +860,30 @@ async function fetchHistoricalRSI() {
 }
 
 // ══════════════════════════════════════════════════
+//  AUTO-LOAD API KEY FROM SERVER
+// ══════════════════════════════════════════════════
+async function loadServerConfig() {
+  try {
+    const r = await fetch('/api/config', {signal:AbortSignal.timeout(3000)});
+    if(r.ok) {
+      const d = await r.json();
+      if(d.fk && !S.apiKey) {
+        S.apiKey = d.fk;
+        localStorage.setItem('finnhub_key', d.fk);
+        setTimeout(connectWS, 500);
+      }
+    }
+  } catch(e) { /* fallback to manual entry */ }
+}
+
+// ══════════════════════════════════════════════════
 //  BOOTSTRAP
 // ══════════════════════════════════════════════════
 buildStructure();
 pollYahoo();
 fetchFearGreed();
 fetchHistoricalRSI();
+loadServerConfig();
 
 // Poll loop
 setInterval(pollYahoo, POLL_MS);
