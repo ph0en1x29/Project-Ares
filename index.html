@@ -867,10 +867,11 @@ async function loadServerConfig() {
     const r = await fetch('/api/config', {signal:AbortSignal.timeout(3000)});
     if(r.ok) {
       const d = await r.json();
-      if(d.fk && !S.apiKey) {
-        S.apiKey = d.fk;
-        localStorage.setItem('finnhub_key', d.fk);
-        setTimeout(connectWS, 500);
+      const key = (d.fk || '').trim();
+      if(key && !S.apiKey) {
+        S.apiKey = key;
+        localStorage.setItem('finnhub_key', key);
+        connectWS();
       }
     }
   } catch(e) { /* fallback to manual entry */ }
@@ -880,10 +881,16 @@ async function loadServerConfig() {
 //  BOOTSTRAP
 // ══════════════════════════════════════════════════
 buildStructure();
+// Priority 1: Connect WS immediately (from localStorage or server)
+if(S.apiKey) {
+  connectWS();
+} else {
+  loadServerConfig(); // fetch key from server → auto-connect
+}
+// Priority 2: Get initial data while WS connects
 pollYahoo();
 fetchFearGreed();
 fetchHistoricalRSI();
-loadServerConfig();
 
 // Poll loop
 setInterval(pollYahoo, POLL_MS);
@@ -896,8 +903,7 @@ setInterval(() => {
   setText('countdown', S.countdown);
 }, 1000);
 
-// WS connect
-if(S.apiKey) setTimeout(connectWS, 1000);
+// WS already connected in bootstrap above
 </script>
 </body>
 </html>
