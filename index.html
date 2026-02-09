@@ -257,14 +257,17 @@ let ws = null;
 // ══════════════════════════════════════════════════
 //  SCORING (same engine)
 // ══════════════════════════════════════════════════
-function rsiProxy(price, sma50) {
+function rsiProxy(price, sma50, ticker) {
+  // Use real 14-period RSI if calculated from historical data
+  if(ticker && META[ticker]?._live?.rsi != null) return META[ticker]._live.rsi;
+  // Fallback to price-distance proxy
   const d = ((price-sma50)/sma50)*100;
   if(d<-15) return 22; if(d<-10) return 28; if(d<-5) return 35;
   if(d<-2) return 40; if(d<2) return 48; if(d<5) return 55; if(d<10) return 62; return 70;
 }
 
-function techScore(price, m) {
-  let s=0; const rsi=rsiProxy(price,m.sma50);
+function techScore(price, m, ticker) {
+  let s=0; const rsi=rsiProxy(price,m.sma50,ticker);
   if(rsi<=30) s+=30; else if(rsi<=40) s+=22; else if(rsi<=50) s+=12; else if(rsi<=60) s+=5;
   const d50=((price-m.sma50)/m.sma50)*100;
   if(d50<-15) s+=25; else if(d50<-10) s+=20; else if(d50<-5) s+=15; else if(d50<0) s+=8;
@@ -306,7 +309,7 @@ function volScore(vix, vixPrev, fg, ivp) {
 function calcAll(ticker) {
   const p=S.prices[ticker]; if(!p||!p.price) return null;
   const m=META[ticker];
-  const t=techScore(p.price,m), v=valScore(p.price,m), c=catScore(m);
+  const t=techScore(p.price,m,ticker), v=valScore(p.price,m), c=catScore(m);
   const vol=volScore(S.market.vix,S.market.vixPrev,S.market.fearGreed,m.ivPctile);
   const w=S.weights;
   const comp=(t.score*w.technical+v*w.value+c.score*w.catalyst+vol*w.volatility)/100;
@@ -439,7 +442,7 @@ function buildStructure() {
   // Header
   html += `<div class="header">
     <div class="header-left">
-      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">ENTRY SIGNAL MODEL v2.0</div>
+      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">ENTRY SIGNAL MODEL v2.1</div>
       <h1 class="mono">Tech Scoring Engine</h1>
       <div class="status-row mono" id="status-row">
         <span class="dot ${S.wsConnected?'ws':S.lastPoll?'live':'off'}" id="status-dot"></span>
@@ -558,10 +561,10 @@ function buildStructure() {
 
   // Footer
   html += `<div class="footer mono">
-    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v2.0</span> •
+    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v2.1</span> •
     ${S.wsConnected?'Real-time via Finnhub WebSocket':'Yahoo Finance polling (15-20min delay)'} •
-    Scores update on every price tick<br>
-    <strong>TECH</strong>: RSI proxy, SMA50/200, support •
+    Live RSI(14) • Live Fear/Greed Index • Scores update on every price tick<br>
+    <strong>TECH</strong>: RSI(14) from historical data, SMA50 (live), SMA200, support •
     <strong>VALUE</strong>: ATH drawdown, PEG, analyst upside •
     <strong>CATALYST</strong>: Earnings proximity, importance •
     <strong>VOL</strong>: VIX, IV percentile, Fear/Greed<br>
@@ -623,7 +626,7 @@ function updateNumbers() {
     setText(`chg-${t}`, (dayPos?'+':'')+dayChg.toFixed(2)+'%');
     setColor(`chg-${t}`, dayPos?'var(--green-bright)':'var(--red-bright)');
     setText(`dd-${t}`, '-'+dd+'%');
-    setText(`rsi-${t}`, '~'+sc.rsi);
+    setText(`rsi-${t}`, (META[t]?._live?.rsi!=null?'':'~')+sc.rsi.toFixed(1));
     setText(`dte-${t}`, sc.dte+'d');
 
     // Scores
@@ -707,7 +710,7 @@ function updateDetailNumbers() {
     {l:'Day Chg',v:`${parseFloat(dayChg)>=0?'+':''}${dayChg}%`,w:parseFloat(dayChg)<-3},
     {l:'Day Range',v:p.high?`$${p.low?.toFixed(2)}–$${p.high?.toFixed(2)}`:'—'},
     {l:'ATH',v:`$${m.ath} (−${dd}%)`},
-    {l:'RSI(est)',v:`~${sc.rsi}`,w:sc.rsi<35},
+    {l:META[t]?._live?.rsi!=null?'RSI(14)':'RSI(est)',v:`${META[t]?._live?.rsi!=null?'':'~'}${sc.rsi.toFixed(1)}`,w:sc.rsi<35},
     {l:'SMA50',v:`$${m.sma50}`,w:p.price<m.sma50},
     {l:'SMA200',v:`$${m.sma200}`},
     {l:'Support',v:`$${m.support}`},
@@ -796,13 +799,78 @@ window.pollYahoo = pollYahoo;
 window.adjustWeight = adjustWeight;
 
 // ══════════════════════════════════════════════════
+//  FEAR/GREED INDEX (live)
+// ══════════════════════════════════════════════════
+async function fetchFearGreed() {
+  try {
+    const r = await fetch('https://api.alternative.me/fng/?limit=1', {signal:AbortSignal.timeout(5000)});
+    const d = await r.json();
+    if(d?.data?.[0]) {
+      S.market.fearGreed = parseInt(d.data[0].value);
+    }
+  } catch(e) { /* keep existing value */ }
+}
+
+// ══════════════════════════════════════════════════
+//  HISTORICAL RSI (real 14-period)
+// ══════════════════════════════════════════════════
+async function fetchHistoricalRSI() {
+  for(const ticker of TICKERS) {
+    try {
+      const end = Math.floor(Date.now()/1000);
+      const start = end - (90*86400); // 90 days
+      const url = `https://corsproxy.io/?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?period1=${start}&period2=${end}&interval=1d`)}`;
+      const r = await fetch(url, {signal:AbortSignal.timeout(10000)});
+      if(!r.ok) continue;
+      const d = await r.json();
+      const closes = d?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+      if(!closes || closes.length < 15) continue;
+      
+      // Calculate 14-period RSI
+      const clean = closes.filter(c => c != null);
+      let gains=0, losses=0;
+      for(let i=1; i<=14 && i<clean.length; i++) {
+        const diff = clean[i]-clean[i-1];
+        if(diff>0) gains+=diff; else losses-=diff;
+      }
+      let avgGain=gains/14, avgLoss=losses/14;
+      for(let i=15; i<clean.length; i++) {
+        const diff=clean[i]-clean[i-1];
+        avgGain=(avgGain*13+(diff>0?diff:0))/14;
+        avgLoss=(avgLoss*13+(diff<0?-diff:0))/14;
+      }
+      const rs = avgLoss===0 ? 100 : avgGain/avgLoss;
+      const rsi = 100-(100/(1+rs));
+      
+      // Store real RSI
+      if(!META[ticker]._live) META[ticker]._live = {};
+      META[ticker]._live.rsi = Math.round(rsi*10)/10;
+      
+      // Also calculate SMA50 and SMA200 from real data
+      if(clean.length >= 50) {
+        META[ticker].sma50 = Math.round(clean.slice(-50).reduce((a,b)=>a+b,0)/50*100)/100;
+      }
+      if(clean.length >= 90) {
+        // We only have 90 days, estimate SMA200 from what we have
+        // Keep the hardcoded one as fallback
+      }
+    } catch(e) { continue; }
+  }
+  updateNumbers();
+}
+
+// ══════════════════════════════════════════════════
 //  BOOTSTRAP
 // ══════════════════════════════════════════════════
 buildStructure();
 pollYahoo();
+fetchFearGreed();
+fetchHistoricalRSI();
 
 // Poll loop
 setInterval(pollYahoo, POLL_MS);
+setInterval(fetchFearGreed, 300000); // Fear/Greed every 5 min
+setInterval(fetchHistoricalRSI, 600000); // RSI refresh every 10 min
 
 // Countdown (just updates the number, no DOM rebuild)
 setInterval(() => {
