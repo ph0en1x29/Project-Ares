@@ -320,7 +320,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:12px;
 //  CONFIG
 // ══════════════════════════════════════════════════
 const DEFAULT_TICKERS = ['NVDA','AMD','MU','MSFT','AAPL','AMZN','GOOGL','META','AVGO','QCOM','INTC','TSM','MRVL','LRCX','AMAT'];
-const POLL_MS = 60000;
+const POLL_MS = 10000; // 10s fallback when WebSocket is down
 const SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 
 // ══════════════════════════════════════════════════
@@ -1844,6 +1844,15 @@ function runAutoTrade() {
 // ══════════════════════════════════════════════════
 //  WEBSOCKET
 // ══════════════════════════════════════════════════
+function isMarketHours() {
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const h = et.getHours(), m = et.getMinutes(), day = et.getDay();
+  if (day === 0 || day === 6) return false;
+  const mins = h * 60 + m;
+  return mins >= 570 && mins <= 960; // 9:30 AM - 4:00 PM ET
+}
+
 function connectWS() {
   if (!S.apiKey) return;
   if (ws) { ws.close(); ws = null; }
@@ -1879,8 +1888,16 @@ function connectWS() {
         }
       } catch (e) { }
     };
-    ws.onerror = () => { S.wsConnected = false; S.mode = 'polling'; updateStatus(); };
-    ws.onclose = () => { S.wsConnected = false; S.mode = 'polling'; updateStatus(); setTimeout(connectWS, 5000); };
+    // Heartbeat: detect stale WebSocket every 10s
+    const wsHeartbeat = setInterval(() => {
+      if (!S.wsConnected) { clearInterval(wsHeartbeat); return; }
+      if (S.wsLast && (Date.now() - S.wsLast.getTime()) > 30000 && isMarketHours()) {
+        console.warn('WebSocket stale (>30s no data during market hours), reconnecting...');
+        ws.close();
+      }
+    }, 10000);
+    ws.onerror = () => { S.wsConnected = false; S.mode = 'polling'; clearInterval(wsHeartbeat); updateStatus(); };
+    ws.onclose = () => { S.wsConnected = false; S.mode = 'polling'; clearInterval(wsHeartbeat); updateStatus(); setTimeout(connectWS, 2000); };
   } catch (e) { S.wsConnected = false; S.mode = 'polling'; }
 }
 
@@ -2302,7 +2319,7 @@ function buildStructure() {
   // ── FOOTER ──
   html += `<div class="footer mono">
     <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v11</span> •
-    ${S.wsConnected ? 'Real-time via Finnhub WebSocket' : 'Finnhub REST polling'} •
+    ${S.wsConnected ? '⚡ LIVE — Finnhub WebSocket' : `🔄 POLLING every ${POLL_MS/1000}s`} •
     Live RSI(14) • Live Fear/Greed Index • Paper Trading • Supabase Integration<br>
     <strong>TECH</strong>: RSI(14), SMA50, SMA200, support/resistance •
     <strong>VALUE</strong>: ATH drawdown, PEG, analyst targets •
