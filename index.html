@@ -361,8 +361,13 @@ let S = {
   
   // Paper trading
   portfolio: { cash: 10000, startingCapital: 10000 },
-  positions: [], // { id, ticker, shares, entryPrice, entryDate, stopLoss, signalAtEntry }
-  tradeHistory: [], // { id, ticker, shares, entryPrice, exitPrice, entryDate, exitDate, pnl, pnlPercent, signalAtEntry }
+  positions: [], // { id, ticker, shares, entryPrice, entryDate, stopLoss, trailStop, trailHigh, takeProfit, maxExitDate, strategy, signalAtEntry, confluenceVotes }
+  tradeHistory: [], // { id, ticker, shares, entryPrice, exitPrice, entryDate, exitDate, pnl, pnlPercent, signalAtEntry, exitReason }
+  
+  // Auto trading
+  autoTradeEnabled: JSON.parse(localStorage.getItem('ares_auto_trade') || 'true'),
+  activeStrategy: localStorage.getItem('ares_strategy') || 'patient',
+  lastAutoTradeCheck: 0,
   
   // Performance tracking
   portfolioHistory: [], // { date, value }
@@ -1031,6 +1036,7 @@ async function pollFinnhub() {
   
   updateNumbers();
   updatePositionPnL();
+  runAutoTrade();
   
   // Save signal snapshots every 15 minutes
   if (Date.now() - S.lastSnapshotSave >= SNAPSHOT_INTERVAL_MS) {
@@ -1566,6 +1572,232 @@ async function closePosition(positionId, isStopLoss = false) {
 }
 
 // ══════════════════════════════════════════════════
+//  AUTO PAPER TRADING ENGINE
+// ══════════════════════════════════════════════════
+
+function toggleAutoTrade() {
+  S.autoTradeEnabled = !S.autoTradeEnabled;
+  localStorage.setItem('ares_auto_trade', JSON.stringify(S.autoTradeEnabled));
+  buildStructure();
+  updateNumbers();
+}
+
+function setStrategy(name) {
+  S.activeStrategy = name;
+  localStorage.setItem('ares_strategy', name);
+  buildStructure();
+  updateNumbers();
+}
+
+// Check for new entry signals and auto-open positions
+function autoTradeEntry() {
+  if (!S.autoTradeEnabled) return;
+  
+  const strat = STRATEGIES[S.activeStrategy];
+  if (!strat) return;
+  
+  // Allocation for this strategy
+  const stratCapital = S.portfolio.startingCapital * strat.alloc;
+  
+  for (const ticker of S.tickers) {
+    // Skip if already have a position in this ticker
+    if (S.positions.some(p => p.ticker === ticker)) continue;
+    
+    const p = S.prices[ticker];
+    if (!p?.price) continue;
+    
+    const conf = calcConfluence(ticker);
+    if (conf.votes < 6) continue; // Need 6/9 minimum
+    
+    const sc = calcAll(ticker);
+    if (!sc || sc.comp < 45) continue; // Composite must be at least ACCUMULATE
+    
+    // Check macro filters
+    const spyChg = S.market.sp500Prev ? ((S.market.sp500 - S.market.sp500Prev) / S.market.sp500Prev * 100) : 0;
+    if (spyChg < -3) continue; // Skip in crash
+    
+    // Check earnings proximity (skip within 7 days)
+    if (sc.dte != null && sc.dte >= 0 && sc.dte <= 7) continue;
+    
+    // Position sizing by confluence
+    const sizePct = strat.sizing[Math.min(conf.votes, 9)] || strat.sizing[6];
+    const positionValue = stratCapital * sizePct;
+    
+    if (positionValue > S.portfolio.cash) continue; // Not enough cash
+    if (positionValue < 50) continue; // Min $50 position
+    
+    const shares = Math.floor(positionValue / p.price);
+    if (shares < 1) continue;
+    
+    // Calculate ATR proxy from price (rough: ~2% of price for large caps)
+    const atrProxy = p.price * 0.02;
+    
+    const stopLoss = p.price - (strat.stopMult * atrProxy);
+    const takeProfit = p.price * (1 + strat.tpPct);
+    const trailActivation = p.price + (strat.trailStart * atrProxy);
+    
+    // Calculate max exit date
+    const entryDate = new Date();
+    const maxExitDate = new Date(entryDate);
+    maxExitDate.setDate(maxExitDate.getDate() + strat.hold + (strat.hold * 2 / 5)); // add weekends roughly
+    
+    const position = {
+      id: Date.now() + Math.random(),
+      ticker,
+      shares,
+      entryPrice: p.price,
+      entryDate: entryDate.toISOString(),
+      stopLoss,
+      trailStop: null, // activates after trailActivation
+      trailHigh: p.price,
+      trailActivation,
+      takeProfit,
+      maxExitDate: maxExitDate.toISOString(),
+      strategy: S.activeStrategy,
+      signalAtEntry: sig(sc.comp).label,
+      confluenceVotes: conf.votes,
+      confluenceFactors: conf.factors.join(', '),
+      atrProxy
+    };
+    
+    S.positions.push(position);
+    S.portfolio.cash -= shares * p.price;
+    
+    // Save to Supabase
+    if (S.supabase) {
+      S.supabase.insert('paper_trades', {
+        ticker: ticker,
+        side: 'buy',
+        entry_price: p.price,
+        entry_score: sc.comp,
+        entry_signal: sig(sc.comp).label,
+        shares,
+        stop_loss: stopLoss,
+        take_profit: takeProfit,
+        status: 'open',
+        notes: `Auto: ${S.activeStrategy} | ${conf.votes}/9 confluence | Factors: ${conf.factors.join(', ')}`
+      });
+      savePortfolio();
+    }
+    
+    console.log(`🤖 AUTO BUY: ${ticker} x${shares} @ $${p.price.toFixed(2)} | ${S.activeStrategy} | ${conf.votes}/9 | Stop: $${stopLoss.toFixed(2)} | TP: $${takeProfit.toFixed(2)}`);
+  }
+}
+
+// Monitor positions and auto-close when exit conditions hit
+function autoTradeExit() {
+  if (!S.autoTradeEnabled) return;
+  
+  const toClose = [];
+  
+  for (const pos of S.positions) {
+    const p = S.prices[pos.ticker];
+    if (!p?.price) continue;
+    
+    let exitReason = null;
+    
+    // 1. Stop loss hit
+    if (pos.stopLoss && p.price <= pos.stopLoss) {
+      exitReason = 'STOP LOSS';
+    }
+    
+    // 2. Trailing stop
+    if (!exitReason && pos.trailStop && p.price <= pos.trailStop) {
+      exitReason = 'TRAIL STOP';
+    }
+    
+    // 3. Take profit
+    if (!exitReason && pos.takeProfit && p.price >= pos.takeProfit) {
+      exitReason = 'TAKE PROFIT';
+    }
+    
+    // 4. Max hold time
+    if (!exitReason && pos.maxExitDate && new Date() >= new Date(pos.maxExitDate)) {
+      exitReason = 'MAX HOLD';
+    }
+    
+    // Update trailing stop (if price moved enough)
+    if (!exitReason && pos.trailActivation) {
+      if (p.price > (pos.trailHigh || pos.entryPrice)) {
+        pos.trailHigh = p.price;
+      }
+      if (pos.trailHigh >= pos.trailActivation) {
+        const strat = STRATEGIES[pos.strategy] || STRATEGIES.patient;
+        const trailDist = (pos.atrProxy || pos.entryPrice * 0.02) * strat.trailDist;
+        pos.trailStop = pos.trailHigh - trailDist;
+      }
+    }
+    
+    if (exitReason) {
+      toClose.push({ pos, exitReason });
+    }
+  }
+  
+  for (const { pos, exitReason } of toClose) {
+    autoClosePosition(pos.id, exitReason);
+  }
+}
+
+async function autoClosePosition(positionId, exitReason) {
+  const idx = S.positions.findIndex(p => p.id === positionId);
+  if (idx === -1) return;
+  
+  const pos = S.positions[idx];
+  const price = S.prices[pos.ticker]?.price || pos.entryPrice;
+  const pnl = (price - pos.entryPrice) * pos.shares;
+  const pnlPercent = ((price - pos.entryPrice) / pos.entryPrice * 100);
+  
+  const trade = {
+    id: pos.id,
+    ticker: pos.ticker,
+    shares: pos.shares,
+    entryPrice: pos.entryPrice,
+    exitPrice: price,
+    entryDate: pos.entryDate,
+    exitDate: new Date().toISOString(),
+    pnl,
+    pnlPercent,
+    signalAtEntry: pos.signalAtEntry,
+    exitReason,
+    strategy: pos.strategy,
+    confluenceVotes: pos.confluenceVotes
+  };
+  
+  S.tradeHistory.unshift(trade);
+  S.portfolio.cash += pos.shares * price;
+  S.positions.splice(idx, 1);
+  
+  // Save to Supabase
+  if (S.supabase) {
+    await S.supabase.update('paper_trades', {
+      exit_price: price,
+      exit_at: trade.exitDate,
+      pnl,
+      pnl_pct: pnlPercent,
+      status: 'closed',
+      notes: `Exit: ${exitReason} | ${pos.strategy}`
+    }, `ticker=eq.${pos.ticker}&status=eq.open`);
+    await savePortfolio();
+  }
+  
+  console.log(`🤖 AUTO ${exitReason}: ${pos.ticker} x${pos.shares} @ $${price.toFixed(2)} | P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`);
+  
+  buildStructure();
+  updateNumbers();
+}
+
+// Run auto trade check (called from pollFinnhub)
+function runAutoTrade() {
+  if (!S.autoTradeEnabled) return;
+  const now = Date.now();
+  if (now - S.lastAutoTradeCheck < 30000) return; // Max once per 30s
+  S.lastAutoTradeCheck = now;
+  
+  autoTradeExit(); // Check exits first
+  autoTradeEntry(); // Then look for new entries
+}
+
+// ══════════════════════════════════════════════════
 //  WEBSOCKET
 // ══════════════════════════════════════════════════
 function connectWS() {
@@ -1807,6 +2039,30 @@ function buildStructure() {
   // ══════════════════════════════════════════════════
   html += `<div class="tab-content ${S.currentTab === 'trading' ? 'active' : ''}" id="tab-trading">`;
   
+  // Auto trade controls
+  html += `<div class="detail-panel" style="margin-bottom:14px;padding:14px 18px">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span class="mono" style="font-size:12px;color:var(--text-2)">🤖 AUTO TRADING</span>
+        <button class="btn btn-sm mono ${S.autoTradeEnabled ? 'btn-green' : 'btn-outline'}" onclick="toggleAutoTrade()">
+          ${S.autoTradeEnabled ? '● ENABLED' : '○ DISABLED'}
+        </button>
+      </div>
+      <div style="display:flex;gap:6px">
+        ${Object.entries(STRATEGIES).map(([key, s]) => `
+          <button class="btn btn-sm mono ${S.activeStrategy === key ? '' : 'btn-outline'}" onclick="setStrategy('${key}')" style="${S.activeStrategy === key ? 'background:var(--blue)' : ''}">
+            ${s.name} (${Math.round(s.alloc * 100)}%)
+          </button>
+        `).join('')}
+      </div>
+    </div>
+    <div class="mono" style="font-size:9px;color:var(--text-3);margin-top:8px">
+      ${S.autoTradeEnabled 
+        ? `Strategy: <strong style="color:var(--text-1)">${STRATEGIES[S.activeStrategy]?.name}</strong> | Hold: ${STRATEGIES[S.activeStrategy]?.hold}d | Stop: ${STRATEGIES[S.activeStrategy]?.stopMult}x ATR | TP: ${Math.round(STRATEGIES[S.activeStrategy]?.tpPct * 100)}% | Trail: ${STRATEGIES[S.activeStrategy]?.trailStart}x ATR → ${STRATEGIES[S.activeStrategy]?.trailDist}x ATR | Min 6/9 confluence`
+        : 'Enable to auto-open and auto-close paper positions based on confluence signals and exit rules'}
+    </div>
+  </div>`;
+  
   // Portfolio summary
   const portfolioValue = calculatePortfolioValue();
   const totalPnL = portfolioValue - S.portfolio.startingCapital;
@@ -1858,7 +2114,9 @@ function buildStructure() {
         <th class="mono">ENTRY</th>
         <th class="mono">CURRENT</th>
         <th class="mono">P&L</th>
-        <th class="mono">SIGNAL</th>
+        <th class="mono">STOP / TRAIL</th>
+        <th class="mono">TP</th>
+        <th class="mono">STRATEGY</th>
         <th class="mono">ACTION</th>
       </tr></thead>
       <tbody>`;
@@ -1867,14 +2125,19 @@ function buildStructure() {
       const price = S.prices[pos.ticker]?.price || pos.entryPrice;
       const pnl = (price - pos.entryPrice) * pos.shares;
       const pnlPercent = ((price - pos.entryPrice) / pos.entryPrice * 100);
+      const activeStop = pos.trailStop || pos.stopLoss;
+      const daysHeld = Math.round((new Date() - new Date(pos.entryDate)) / 86400000);
+      const maxDays = pos.maxExitDate ? Math.round((new Date(pos.maxExitDate) - new Date(pos.entryDate)) / 86400000) : '—';
       
       html += `<tr>
-        <td class="mono" style="font-weight:700">${pos.ticker}</td>
+        <td class="mono" style="font-weight:700">${pos.ticker}<br><span style="font-size:8px;color:var(--text-3)">${pos.confluenceVotes || '?'}/9 conf</span></td>
         <td class="mono">${pos.shares}</td>
         <td class="mono">$${pos.entryPrice.toFixed(2)}</td>
         <td class="mono">$${price.toFixed(2)}</td>
-        <td class="mono" style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)</td>
-        <td class="mono" style="font-size:10px">${pos.signalAtEntry}</td>
+        <td class="mono" style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}<br><span style="font-size:10px">${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%</span></td>
+        <td class="mono" style="font-size:10px">${activeStop ? '$' + activeStop.toFixed(2) : '—'}${pos.trailStop ? ' 🔄' : ''}</td>
+        <td class="mono" style="font-size:10px">${pos.takeProfit ? '$' + pos.takeProfit.toFixed(2) : '—'}</td>
+        <td class="mono" style="font-size:10px">${pos.strategy || 'manual'}<br><span style="color:var(--text-3)">${daysHeld}d / ${maxDays}d</span></td>
         <td><button class="btn btn-sm btn-red" onclick="openCloseModal(${pos.id})">Close</button></td>
       </tr>`;
     }
@@ -1902,11 +2165,12 @@ function buildStructure() {
         <th class="mono">ENTRY</th>
         <th class="mono">EXIT</th>
         <th class="mono">P&L</th>
-        <th class="mono">SIGNAL</th>
+        <th class="mono">EXIT REASON</th>
       </tr></thead>
       <tbody>`;
     
     for (const trade of S.tradeHistory.slice(0, 20)) {
+      const exitColor = trade.exitReason === 'TAKE PROFIT' ? 'var(--green)' : trade.exitReason === 'STOP LOSS' ? 'var(--red)' : 'var(--text-2)';
       html += `<tr>
         <td class="mono" style="font-size:10px">${new Date(trade.exitDate).toLocaleDateString()}</td>
         <td class="mono" style="font-weight:700">${trade.ticker}</td>
@@ -1914,7 +2178,7 @@ function buildStructure() {
         <td class="mono">$${trade.entryPrice.toFixed(2)}</td>
         <td class="mono">$${trade.exitPrice.toFixed(2)}</td>
         <td class="mono" style="color:${trade.pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${trade.pnl >= 0 ? '+' : ''}$${trade.pnl.toFixed(2)} (${trade.pnlPercent >= 0 ? '+' : ''}${trade.pnlPercent.toFixed(2)}%)</td>
-        <td class="mono" style="font-size:10px">${trade.signalAtEntry}</td>
+        <td class="mono" style="font-size:10px;color:${exitColor}">${trade.exitReason || trade.signalAtEntry}</td>
       </tr>`;
     }
     
@@ -2395,6 +2659,8 @@ window.handleSearch = handleSearch;
 window.addTicker = addTicker;
 window.removeTicker = removeTicker;
 window.hideSearch = hideSearch;
+window.toggleAutoTrade = toggleAutoTrade;
+window.setStrategy = setStrategy;
 window.openBuyModal = openBuyModal;
 window.closeBuyModal = closeBuyModal;
 window.executeBuy = executeBuy;
