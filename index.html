@@ -187,6 +187,57 @@
   ::-webkit-scrollbar { width:4px; }
   ::-webkit-scrollbar-track { background:transparent; }
   ::-webkit-scrollbar-thumb { background:var(--bg-3); border-radius:2px; }
+
+  /* Tab system */
+  .tab-bar { display:flex; gap:2px; margin-bottom:14px; background:var(--bg-2); border-radius:10px; padding:3px; border:1px solid var(--border); }
+  .tab-btn { flex:1; padding:8px 16px; border:none; border-radius:8px; background:transparent; color:var(--text-2); font-weight:600; font-size:12px; cursor:pointer; transition:all 0.2s; font-family:'DM Sans',sans-serif; }
+  .tab-btn.active { background:var(--blue); color:white; }
+  .tab-btn:hover:not(.active) { color:var(--text-0); background:var(--bg-3); }
+  .tab-content { display:none; }
+  .tab-content.active { display:block; }
+
+  /* Search */
+  .search-bar { position:relative; margin-bottom:12px; }
+  .search-bar input { width:100%; background:var(--bg-2); border:1px solid var(--border); border-radius:8px; padding:10px 14px 10px 36px; color:var(--text-0); font-size:13px; outline:none; font-family:'DM Sans',sans-serif; }
+  .search-bar input:focus { border-color:var(--blue); }
+  .search-bar input::placeholder { color:var(--text-3); }
+  .search-bar .icon { position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--text-3); font-size:14px; }
+  .search-results { position:absolute; top:100%; left:0; right:0; background:var(--bg-2); border:1px solid var(--border); border-radius:8px; margin-top:4px; max-height:200px; overflow-y:auto; z-index:100; display:none; }
+  .search-results.show { display:block; }
+  .search-item { padding:8px 14px; cursor:pointer; display:flex; justify-content:space-between; font-size:12px; }
+  .search-item:hover { background:var(--bg-3); }
+  .search-item .sym { font-weight:700; color:var(--text-0); }
+  .search-item .desc { color:var(--text-2); font-size:10px; }
+
+  /* Paper Trading */
+  .portfolio-summary { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:14px; }
+  @media(max-width:700px) { .portfolio-summary { grid-template-columns:repeat(2,1fr); } }
+  .portfolio-card { background:var(--bg-2); border:1px solid var(--border); border-radius:10px; padding:14px; }
+  .portfolio-card .label { font-size:8px; color:var(--text-3); letter-spacing:1px; text-transform:uppercase; }
+  .portfolio-card .value { font-size:22px; font-weight:800; margin-top:4px; }
+  .portfolio-card .sub { font-size:10px; color:var(--text-2); margin-top:2px; }
+
+  .trades-table { width:100%; border-collapse:collapse; font-size:11px; }
+  .trades-table th { text-align:left; padding:8px 10px; font-size:8px; color:var(--text-3); letter-spacing:1px; text-transform:uppercase; border-bottom:1px solid var(--border); }
+  .trades-table td { padding:8px 10px; border-bottom:1px solid var(--border)40; color:var(--text-1); }
+  .trades-table tr:hover { background:var(--bg-3); }
+
+  /* Modal */
+  .modal-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:200; display:flex; align-items:center; justify-content:center; }
+  .modal { background:var(--bg-2); border:1px solid var(--border); border-radius:12px; padding:24px; min-width:320px; max-width:400px; }
+  .modal h3 { font-size:16px; margin-bottom:14px; }
+  .modal label { font-size:10px; color:var(--text-2); display:block; margin-bottom:4px; margin-top:10px; }
+  .modal input { width:100%; background:var(--bg-1); border:1px solid var(--border); border-radius:6px; padding:8px; color:var(--text-0); font-size:13px; outline:none; }
+  .modal input:focus { border-color:var(--blue); }
+  .modal-actions { display:flex; gap:8px; margin-top:16px; justify-content:flex-end; }
+
+  /* Performance chart */
+  .perf-chart { background:var(--bg-2); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:14px; }
+  @media(max-width:700px) { .stat-grid { grid-template-columns:repeat(2,1fr); } }
+
+  .loading-spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--text-3); border-top-color:var(--blue); border-radius:50%; animation:spin 0.6s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -941,6 +992,596 @@ setInterval(() => {
 }, 1000);
 
 // WS already connected in bootstrap above
+
+// ══════════════════════════════════════════════════
+//  SUPABASE CLIENT
+// ══════════════════════════════════════════════════
+let SB = { url:'', key:'' };
+
+async function initSupabase() {
+  try {
+    const r = await fetch('/api/config', {signal:AbortSignal.timeout(3000)});
+    if(r.ok) {
+      const d = await r.json();
+      SB.url = (d.sbUrl||'').trim();
+      SB.key = (d.sbKey||'').trim();
+    }
+  } catch(e) {}
+}
+
+async function sbQuery(table, method, body, params) {
+  if(!SB.url||!SB.key) return null;
+  let url = `${SB.url}/rest/v1/${table}`;
+  if(params) url += '?' + new URLSearchParams(params).toString();
+  const opts = {
+    method: method||'GET',
+    headers: { 'apikey':SB.key, 'Authorization':`Bearer ${SB.key}`, 'Content-Type':'application/json', 'Prefer':'return=representation' }
+  };
+  if(body) opts.body = JSON.stringify(body);
+  try {
+    const r = await fetch(url, opts);
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+// ══════════════════════════════════════════════════
+//  DYNAMIC SCORING — Any stock from Finnhub data
+// ══════════════════════════════════════════════════
+async function fetchTickerData(ticker) {
+  const [quote, profile, metrics, target, recs, earnings, options] = await Promise.all([
+    fhGet(`/quote?symbol=${ticker}`),
+    fhGet(`/stock/profile2?symbol=${ticker}`),
+    fhGet(`/stock/metric?symbol=${ticker}&metric=all`),
+    fhGet(`/stock/price-target?symbol=${ticker}`),
+    fhGet(`/stock/recommendation?symbol=${ticker}`),
+    fhGet(`/calendar/earnings?symbol=${ticker}`),
+    fhGet(`/stock/option-chain?symbol=${ticker}`)
+  ]);
+
+  if(!quote?.c) return null;
+
+  const met = metrics?.metric || {};
+  const latestRec = recs?.[0] || {};
+  const w52high = met['52WeekHigh'] || quote.c * 1.2;
+  const w52low = met['52WeekLow'] || quote.c * 0.8;
+
+  // Find nearest earnings date
+  let earningsDate = null;
+  if(earnings?.earningsCalendar) {
+    const future = earnings.earningsCalendar.filter(e => new Date(e.date) > new Date()).sort((a,b) => new Date(a.date)-new Date(b.date));
+    if(future.length) earningsDate = future[0].date;
+  }
+
+  // Options P/C ratio
+  let pcRatio=null, callOI=0, putOI=0;
+  if(options?.data?.length) {
+    const near = options.data[0];
+    const calls = near.options?.CALL || [];
+    const puts = near.options?.PUT || [];
+    callOI = calls.reduce((a,o) => a+(o.openInterest||0), 0);
+    putOI = puts.reduce((a,o) => a+(o.openInterest||0), 0);
+    pcRatio = callOI > 0 ? putOI/callOI : null;
+  }
+
+  // Build dynamic META
+  const dynMeta = {
+    name: profile?.name || ticker,
+    color: '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6,'0'),
+    allocation: 0,
+    sma50: met['10DayAverageTradingVolume'] ? quote.c : quote.c * 0.95, // proxy
+    sma200: quote.c * 0.9, // rough proxy
+    support: w52low,
+    resistance: w52high,
+    ath: w52high,
+    earningsDate: earningsDate || '2026-12-31',
+    earningsImportance: 50,
+    analystTarget: target?.targetMean || quote.c * 1.15,
+    analystBuy: latestRec.buy || 10,
+    analystSell: latestRec.sell || 2,
+    forwardPe: met.peBasicExclExtraTTM || 20,
+    pegRatio: met.pegRatio || 1.5,
+    ivPctile: 50,
+    sentiment: 50,
+    notes: profile?.finnhubIndustry || 'Dynamically scored',
+    _live: { pcRatio, callOI, putOI }
+  };
+
+  // Store price
+  S.prices[ticker] = { price:quote.c, prevClose:quote.pc, high:quote.h, low:quote.l, open:quote.o, source:'finnhub-rest' };
+
+  // Add to META
+  META[ticker] = dynMeta;
+
+  // Add to TICKERS if not there
+  if(!TICKERS.includes(ticker)) TICKERS.push(ticker);
+
+  return dynMeta;
+}
+
+// ══════════════════════════════════════════════════
+//  SEARCH
+// ══════════════════════════════════════════════════
+let searchTimeout = null;
+
+async function searchTickers(query) {
+  if(!query || query.length < 1) return [];
+  const d = await fhGet(`/search?q=${encodeURIComponent(query)}`);
+  if(!d?.result) return [];
+  return d.result.filter(r => r.type === 'Common Stock').slice(0, 8);
+}
+
+window.handleSearch = async (e) => {
+  const q = e.target.value.trim();
+  const resultsEl = document.getElementById('search-results');
+  if(!q) { resultsEl.classList.remove('show'); return; }
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(async () => {
+    const results = await searchTickers(q);
+    if(!results.length) { resultsEl.classList.remove('show'); return; }
+    resultsEl.innerHTML = results.map(r => `<div class="search-item" onclick="addTicker('${r.symbol}')">
+      <span class="sym mono">${r.symbol}</span>
+      <span class="desc">${r.description}</span>
+    </div>`).join('');
+    resultsEl.classList.add('show');
+  }, 300);
+};
+
+window.addTicker = async (ticker) => {
+  document.getElementById('search-results').classList.remove('show');
+  document.getElementById('search-input').value = '';
+
+  if(META[ticker]) { S.selected = ticker; buildStructure(); updateNumbers(); return; }
+
+  // Show loading
+  const btn = document.getElementById('search-input');
+  btn.placeholder = `Loading ${ticker}...`;
+
+  const data = await fetchTickerData(ticker);
+  btn.placeholder = 'Search any stock...';
+
+  if(!data) return;
+
+  // Save to Supabase watchlist
+  sbQuery('watchlist', 'POST', { ticker, name:data.name, sector:data.notes, is_core:false });
+
+  S.selected = ticker;
+  buildStructure();
+  updateNumbers();
+  // Poll this new ticker too
+  pollFinnhub();
+};
+
+// ══════════════════════════════════════════════════
+//  SIGNAL SNAPSHOT SAVING (every 15 min)
+// ══════════════════════════════════════════════════
+let lastSnapshotTime = 0;
+
+async function saveSignalSnapshots() {
+  if(Date.now() - lastSnapshotTime < 900000) return; // 15 min
+  lastSnapshotTime = Date.now();
+
+  for(const t of TICKERS) {
+    const sc = calcAll(t);
+    const p = S.prices[t];
+    if(!sc || !p?.price) continue;
+    const s = sig(sc.comp);
+
+    sbQuery('signal_snapshots', 'POST', {
+      ticker: t, price: p.price,
+      tech_score: sc.tech, value_score: sc.val,
+      catalyst_score: sc.cat, volatility_score: sc.vol,
+      composite_score: sc.comp, signal: s.label,
+      rsi: sc.rsi, pc_ratio: META[t]?._live?.pcRatio,
+      vix: S.market.vix, fear_greed: S.market.fearGreed,
+      weights: S.weights
+    });
+  }
+}
+
+// Save snapshots on each poll
+const origPoll = pollFinnhub;
+// Hook into poll cycle
+setInterval(saveSignalSnapshots, 900000); // every 15 min
+
+// ══════════════════════════════════════════════════
+//  PAPER TRADING
+// ══════════════════════════════════════════════════
+let paperTrades = [];
+let portfolio = { starting_capital:10000, current_capital:10000, total_pnl:0, total_trades:0, winning_trades:0, losing_trades:0 };
+
+async function loadPaperData() {
+  const trades = await sbQuery('paper_trades', 'GET', null, {order:'created_at.desc', limit:'50'});
+  if(trades) paperTrades = trades;
+  const port = await sbQuery('portfolio', 'GET', null, {limit:'1'});
+  if(port?.[0]) portfolio = port[0];
+}
+
+window.showBuyModal = (ticker) => {
+  const p = S.prices[ticker];
+  if(!p?.price) return;
+  const sc = calcAll(ticker);
+  const s = sc ? sig(sc.comp) : {label:'—'};
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.id = 'trade-modal';
+  modal.innerHTML = `<div class="modal">
+    <h3 class="mono">📈 Paper Buy — ${ticker}</h3>
+    <div style="font-size:12px;color:var(--text-1);margin-bottom:8px">
+      Price: <strong>$${p.price.toFixed(2)}</strong> • Signal: <strong>${s.label}</strong> ${sc?`(${sc.comp.toFixed(0)})`:''}
+    </div>
+    <label class="mono">SHARES</label>
+    <input type="number" id="modal-shares" value="10" min="1" step="1">
+    <label class="mono">STOP LOSS ($)</label>
+    <input type="number" id="modal-stop" placeholder="Optional" step="0.01">
+    <label class="mono">TAKE PROFIT ($)</label>
+    <input type="number" id="modal-tp" placeholder="Optional" step="0.01">
+    <div style="font-size:10px;color:var(--text-3);margin-top:8px">
+      Cost: <span id="modal-cost">$${(p.price*10).toFixed(2)}</span> • Available: $${parseFloat(portfolio.current_capital).toFixed(2)}
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="document.getElementById('trade-modal').remove()">Cancel</button>
+      <button class="btn" onclick="executeBuy('${ticker}')">Buy</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+
+  document.getElementById('modal-shares').oninput = (e) => {
+    const cost = p.price * parseInt(e.target.value||0);
+    document.getElementById('modal-cost').textContent = '$'+cost.toFixed(2);
+  };
+};
+
+window.executeBuy = async (ticker) => {
+  const shares = parseInt(document.getElementById('modal-shares').value) || 1;
+  const stop = parseFloat(document.getElementById('modal-stop').value) || null;
+  const tp = parseFloat(document.getElementById('modal-tp').value) || null;
+  const p = S.prices[ticker];
+  const sc = calcAll(ticker);
+  const s = sc ? sig(sc.comp) : {label:'—'};
+  const cost = p.price * shares;
+
+  if(cost > parseFloat(portfolio.current_capital)) {
+    alert('Insufficient capital'); return;
+  }
+
+  const trade = {
+    ticker, side:'buy', entry_price:p.price, entry_score:sc?.comp||0,
+    entry_signal:s.label, shares, stop_loss:stop, take_profit:tp, status:'open'
+  };
+
+  const result = await sbQuery('paper_trades', 'POST', trade);
+  if(result) paperTrades.unshift(result[0]);
+
+  // Update portfolio
+  portfolio.current_capital = parseFloat(portfolio.current_capital) - cost;
+  portfolio.total_trades = parseInt(portfolio.total_trades) + 1;
+  await sbQuery('portfolio', 'PATCH', {
+    current_capital: portfolio.current_capital,
+    total_trades: portfolio.total_trades
+  }, {id:`eq.${portfolio.id}`});
+
+  document.getElementById('trade-modal').remove();
+  if(S.activeTab === 'trading') renderTradingView();
+};
+
+window.closeTrade = async (tradeId) => {
+  const trade = paperTrades.find(t => t.id === tradeId);
+  if(!trade) return;
+  const p = S.prices[trade.ticker];
+  if(!p?.price) return;
+
+  const pnl = (p.price - parseFloat(trade.entry_price)) * parseInt(trade.shares);
+  const pnlPct = ((p.price - parseFloat(trade.entry_price)) / parseFloat(trade.entry_price) * 100);
+  const holdDays = Math.ceil((Date.now() - new Date(trade.entry_at).getTime()) / 86400000);
+  const sc = calcAll(trade.ticker);
+  const s = sc ? sig(sc.comp) : {label:'—'};
+
+  await sbQuery('paper_trades', 'PATCH', {
+    exit_price:p.price, exit_score:sc?.comp||0, exit_signal:s.label,
+    exit_at:new Date().toISOString(), pnl, pnl_pct:pnlPct, hold_days:holdDays, status:'closed'
+  }, {id:`eq.${tradeId}`});
+
+  // Update local
+  trade.exit_price = p.price; trade.pnl = pnl; trade.pnl_pct = pnlPct; trade.status = 'closed'; trade.hold_days = holdDays;
+
+  // Update portfolio
+  const proceeds = p.price * parseInt(trade.shares);
+  portfolio.current_capital = parseFloat(portfolio.current_capital) + proceeds;
+  portfolio.total_pnl = parseFloat(portfolio.total_pnl) + pnl;
+  if(pnl > 0) portfolio.winning_trades = parseInt(portfolio.winning_trades) + 1;
+  else portfolio.losing_trades = parseInt(portfolio.losing_trades) + 1;
+
+  await sbQuery('portfolio', 'PATCH', {
+    current_capital:portfolio.current_capital, total_pnl:portfolio.total_pnl,
+    winning_trades:portfolio.winning_trades, losing_trades:portfolio.losing_trades
+  }, {id:`eq.${portfolio.id}`});
+
+  renderTradingView();
+};
+
+// ══════════════════════════════════════════════════
+//  TAB SYSTEM + VIEWS
+// ══════════════════════════════════════════════════
+S.activeTab = 'signals';
+
+window.switchTab = (tab) => {
+  S.activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === `tab-${tab}`));
+  if(tab === 'trading') renderTradingView();
+  if(tab === 'performance') renderPerformanceView();
+};
+
+function renderTradingView() {
+  const el = document.getElementById('trading-content');
+  if(!el) return;
+
+  const openTrades = paperTrades.filter(t => t.status === 'open');
+  const closedTrades = paperTrades.filter(t => t.status === 'closed');
+  const winRate = parseInt(portfolio.total_trades) > 0 ? (parseInt(portfolio.winning_trades) / (parseInt(portfolio.winning_trades)+parseInt(portfolio.losing_trades)) * 100) : 0;
+
+  // Calculate unrealized P&L
+  let unrealizedPnl = 0;
+  openTrades.forEach(t => {
+    const p = S.prices[t.ticker];
+    if(p?.price) unrealizedPnl += (p.price - parseFloat(t.entry_price)) * parseInt(t.shares);
+  });
+
+  const totalValue = parseFloat(portfolio.current_capital) + openTrades.reduce((a,t) => {
+    const p = S.prices[t.ticker]; return a + (p?.price||parseFloat(t.entry_price)) * parseInt(t.shares);
+  }, 0);
+
+  el.innerHTML = `
+    <div class="portfolio-summary">
+      <div class="portfolio-card">
+        <div class="mono label">Portfolio Value</div>
+        <div class="mono value">$${totalValue.toFixed(2)}</div>
+        <div class="mono sub ${totalValue>=parseFloat(portfolio.starting_capital)?'up':'dn'}">${((totalValue/parseFloat(portfolio.starting_capital)-1)*100).toFixed(2)}% all-time</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Cash Available</div>
+        <div class="mono value">$${parseFloat(portfolio.current_capital).toFixed(2)}</div>
+        <div class="mono sub">${openTrades.length} open position${openTrades.length!==1?'s':''}</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Realized P&L</div>
+        <div class="mono value ${parseFloat(portfolio.total_pnl)>=0?'up':'dn'}">$${parseFloat(portfolio.total_pnl).toFixed(2)}</div>
+        <div class="mono sub">Unrealized: <span class="${unrealizedPnl>=0?'up':'dn'}">$${unrealizedPnl.toFixed(2)}</span></div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Win Rate</div>
+        <div class="mono value">${winRate.toFixed(0)}%</div>
+        <div class="mono sub">${portfolio.winning_trades}W / ${portfolio.losing_trades}L of ${portfolio.total_trades} trades</div>
+      </div>
+    </div>
+
+    ${openTrades.length ? `
+    <div class="mono section-title" style="margin-bottom:8px">OPEN POSITIONS</div>
+    <div class="detail-panel" style="padding:0;overflow:hidden;margin-bottom:14px">
+      <table class="trades-table">
+        <thead><tr><th>Ticker</th><th>Entry</th><th>Current</th><th>Shares</th><th>P&L</th><th>Signal</th><th>Action</th></tr></thead>
+        <tbody>${openTrades.map(t => {
+          const p = S.prices[t.ticker];
+          const cur = p?.price || parseFloat(t.entry_price);
+          const pnl = (cur - parseFloat(t.entry_price)) * parseInt(t.shares);
+          const pnlPct = ((cur - parseFloat(t.entry_price)) / parseFloat(t.entry_price) * 100);
+          return `<tr>
+            <td class="mono" style="font-weight:700">${t.ticker}</td>
+            <td class="mono">$${parseFloat(t.entry_price).toFixed(2)}</td>
+            <td class="mono">$${cur.toFixed(2)}</td>
+            <td class="mono">${t.shares}</td>
+            <td class="mono ${pnl>=0?'up':'dn'}">$${pnl.toFixed(2)} (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)</td>
+            <td><span class="signal-badge mono" style="font-size:7px">${t.entry_signal}</span></td>
+            <td><button class="btn btn-sm" style="background:var(--red)" onclick="closeTrade('${t.id}')">Close</button></td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>` : '<div style="text-align:center;padding:24px;color:var(--text-3)">No open positions. Use the Paper Buy button on any stock card.</div>'}
+
+    ${closedTrades.length ? `
+    <div class="mono section-title" style="margin-bottom:8px">TRADE HISTORY</div>
+    <div class="detail-panel" style="padding:0;overflow:hidden">
+      <table class="trades-table">
+        <thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>Shares</th><th>P&L</th><th>Hold</th><th>Signal</th></tr></thead>
+        <tbody>${closedTrades.slice(0,20).map(t => {
+          const pnl = parseFloat(t.pnl||0);
+          const pnlPct = parseFloat(t.pnl_pct||0);
+          return `<tr>
+            <td class="mono" style="font-weight:700">${t.ticker}</td>
+            <td class="mono">$${parseFloat(t.entry_price).toFixed(2)}</td>
+            <td class="mono">$${parseFloat(t.exit_price||0).toFixed(2)}</td>
+            <td class="mono">${t.shares}</td>
+            <td class="mono ${pnl>=0?'up':'dn'}">$${pnl.toFixed(2)} (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)</td>
+            <td class="mono">${t.hold_days||'—'}d</td>
+            <td><span class="signal-badge mono" style="font-size:7px">${t.entry_signal} → ${t.exit_signal||'—'}</span></td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>` : ''}
+  `;
+}
+
+function renderPerformanceView() {
+  const el = document.getElementById('performance-content');
+  if(!el) return;
+
+  const closed = paperTrades.filter(t => t.status === 'closed');
+  const wins = closed.filter(t => parseFloat(t.pnl||0) > 0);
+  const losses = closed.filter(t => parseFloat(t.pnl||0) <= 0);
+  const avgReturn = closed.length ? closed.reduce((a,t) => a+parseFloat(t.pnl_pct||0), 0) / closed.length : 0;
+  const bestTrade = closed.length ? Math.max(...closed.map(t => parseFloat(t.pnl_pct||0))) : 0;
+  const worstTrade = closed.length ? Math.min(...closed.map(t => parseFloat(t.pnl_pct||0))) : 0;
+  const avgHold = closed.length ? closed.reduce((a,t) => a+parseInt(t.hold_days||0), 0) / closed.length : 0;
+
+  // Simple portfolio value chart data
+  const totalValue = parseFloat(portfolio.current_capital) + paperTrades.filter(t=>t.status==='open').reduce((a,t) => {
+    const p = S.prices[t.ticker]; return a + (p?.price||parseFloat(t.entry_price)) * parseInt(t.shares);
+  }, 0);
+  const returnPct = ((totalValue / parseFloat(portfolio.starting_capital)) - 1) * 100;
+
+  el.innerHTML = `
+    <div class="stat-grid">
+      <div class="portfolio-card">
+        <div class="mono label">Total Return</div>
+        <div class="mono value ${returnPct>=0?'up':'dn'}">${returnPct>=0?'+':''}${returnPct.toFixed(2)}%</div>
+        <div class="mono sub">$${parseFloat(portfolio.starting_capital).toFixed(0)} → $${totalValue.toFixed(0)}</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Win Rate</div>
+        <div class="mono value">${closed.length ? (wins.length/closed.length*100).toFixed(0) : 0}%</div>
+        <div class="mono sub">${wins.length} wins / ${losses.length} losses</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Avg Return/Trade</div>
+        <div class="mono value ${avgReturn>=0?'up':'dn'}">${avgReturn>=0?'+':''}${avgReturn.toFixed(2)}%</div>
+        <div class="mono sub">Avg hold: ${avgHold.toFixed(0)} days</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Best Trade</div>
+        <div class="mono value up">+${bestTrade.toFixed(2)}%</div>
+        <div class="mono sub">Worst: <span class="dn">${worstTrade.toFixed(2)}%</span></div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Total Trades</div>
+        <div class="mono value">${closed.length}</div>
+        <div class="mono sub">${paperTrades.filter(t=>t.status==='open').length} open</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="mono label">Realized P&L</div>
+        <div class="mono value ${parseFloat(portfolio.total_pnl)>=0?'up':'dn'}">$${parseFloat(portfolio.total_pnl).toFixed(2)}</div>
+        <div class="mono sub">From ${closed.length} closed trades</div>
+      </div>
+    </div>
+
+    ${closed.length ? `
+    <div class="mono section-title" style="margin-bottom:8px">SIGNAL ACCURACY</div>
+    <div class="detail-panel">
+      ${['STRONG BUY','BUY','ACCUMULATE','WAIT','AVOID'].map(signal => {
+        const sigTrades = closed.filter(t => t.entry_signal === signal);
+        if(!sigTrades.length) return '';
+        const sigWins = sigTrades.filter(t => parseFloat(t.pnl||0) > 0);
+        const sigAvg = sigTrades.reduce((a,t) => a+parseFloat(t.pnl_pct||0), 0) / sigTrades.length;
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)40">
+          <span class="mono" style="font-size:11px;font-weight:700">${signal}</span>
+          <span class="mono" style="font-size:10px;color:var(--text-2)">${sigTrades.length} trades</span>
+          <span class="mono" style="font-size:10px">${(sigWins.length/sigTrades.length*100).toFixed(0)}% win</span>
+          <span class="mono ${sigAvg>=0?'up':'dn'}" style="font-size:10px">${sigAvg>=0?'+':''}${sigAvg.toFixed(2)}% avg</span>
+        </div>`;
+      }).join('')}
+    </div>` : '<div style="text-align:center;padding:40px;color:var(--text-3)">Complete some trades to see performance analytics.</div>'}
+  `;
+}
+
+// ══════════════════════════════════════════════════
+//  REBUILD STRUCTURE WITH TABS + SEARCH
+// ══════════════════════════════════════════════════
+const origBuildStructure = buildStructure;
+buildStructure = function() {
+  origBuildStructure();
+
+  // Wrap existing content in signals tab, add search + tabs
+  const app = document.getElementById('app');
+  const existing = app.innerHTML;
+
+  // Insert search bar after header
+  const headerEnd = existing.indexOf('</div></div>') + 12; // after header div
+
+  // Build tabbed layout
+  const searchHtml = `<div class="search-bar">
+    <span class="icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search any stock..." oninput="handleSearch(event)" autocomplete="off">
+    <div class="search-results" id="search-results"></div>
+  </div>`;
+
+  const tabBar = `<div class="tab-bar">
+    <button class="tab-btn ${S.activeTab==='signals'?'active':''}" data-tab="signals" onclick="switchTab('signals')">📊 Signals</button>
+    <button class="tab-btn ${S.activeTab==='trading'?'active':''}" data-tab="trading" onclick="switchTab('trading')">💰 Paper Trading</button>
+    <button class="tab-btn ${S.activeTab==='performance'?'active':''}" data-tab="performance" onclick="switchTab('performance')">📈 Performance</button>
+  </div>`;
+
+  // Add Paper Buy button to each card
+  let modifiedContent = existing;
+  for(const t of TICKERS) {
+    const oldComposite = `<div class="composite-row"><span class="mono cl">COMPOSITE</span><span class="mono cv live-num" id="comp-${t}">`;
+    const buyBtn = `<div style="margin-top:6px"><button class="btn btn-sm mono" style="width:100%;font-size:9px;padding:5px" onclick="event.stopPropagation();showBuyModal('${t}')">📈 Paper Buy</button></div>`;
+    modifiedContent = modifiedContent.replace(
+      new RegExp(`(</div>\\s*</div>\\s*)(</div>)`),
+      modifiedContent // skip this complex replace, we'll add buy buttons differently
+    );
+  }
+
+  // Simpler approach: inject after the app content
+  const footerIdx = modifiedContent.lastIndexOf('<div class="footer');
+  const beforeFooter = modifiedContent.substring(0, footerIdx);
+  const footer = modifiedContent.substring(footerIdx);
+
+  // Find where header ends and main content starts (after api-setup)
+  const marketRowIdx = beforeFooter.indexOf('<div class="market-row">');
+
+  app.innerHTML = beforeFooter.substring(0, marketRowIdx)
+    + searchHtml
+    + tabBar
+    + '<div class="tab-content ' + (S.activeTab==='signals'?'active':'') + '" id="tab-signals">'
+    + beforeFooter.substring(marketRowIdx)
+    + '</div>'
+    + '<div class="tab-content ' + (S.activeTab==='trading'?'active':'') + '" id="tab-trading"><div id="trading-content"></div></div>'
+    + '<div class="tab-content ' + (S.activeTab==='performance'?'active':'') + '" id="tab-performance"><div id="performance-content"></div></div>'
+    + footer;
+
+  // Re-attach card click listeners
+  document.querySelectorAll('.ticker-card').forEach(c => {
+    c.onclick = () => {
+      S.prevSelected = S.selected;
+      S.selected = c.dataset.ticker;
+      buildStructure();
+      updateNumbers();
+    };
+  });
+
+  // Add paper buy buttons to cards
+  document.querySelectorAll('.ticker-card').forEach(c => {
+    const ticker = c.dataset.ticker;
+    const compositeRow = c.querySelector('.composite-row');
+    if(compositeRow && !c.querySelector('.paper-buy-btn')) {
+      const btn = document.createElement('div');
+      btn.className = 'paper-buy-btn';
+      btn.style.cssText = 'margin-top:6px';
+      btn.innerHTML = `<button class="btn btn-sm mono" style="width:100%;font-size:9px;padding:5px;background:var(--green)" onclick="event.stopPropagation();showBuyModal('${ticker}')">📈 Paper Buy</button>`;
+      compositeRow.after(btn);
+    }
+  });
+
+  // Close search on click outside
+  document.addEventListener('click', (e) => {
+    if(!e.target.closest('.search-bar')) {
+      const sr = document.getElementById('search-results');
+      if(sr) sr.classList.remove('show');
+    }
+  });
+
+  if(S.activeTab === 'trading') renderTradingView();
+  if(S.activeTab === 'performance') renderPerformanceView();
+};
+
+// ══════════════════════════════════════════════════
+//  INIT SUPABASE + LOAD DATA
+// ══════════════════════════════════════════════════
+(async () => {
+  await initSupabase();
+  await loadPaperData();
+  // Load watchlist from Supabase
+  const watchlist = await sbQuery('watchlist', 'GET', null, {order:'allocation_pct.desc'});
+  if(watchlist?.length) {
+    for(const w of watchlist) {
+      if(!TICKERS.includes(w.ticker) && !META[w.ticker]) {
+        await fetchTickerData(w.ticker);
+      }
+    }
+  }
+  buildStructure();
+  updateNumbers();
+})();
 </script>
 </body>
 </html>
