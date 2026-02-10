@@ -319,7 +319,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:12px;
 // ══════════════════════════════════════════════════
 //  CONFIG
 // ══════════════════════════════════════════════════
-const DEFAULT_TICKERS = ['NVDA','AMD','MU','MSFT','NFLX'];
+const DEFAULT_TICKERS = ['NVDA','AMD','MU','MSFT','AAPL','AMZN','GOOGL','META','AVGO','QCOM','INTC','TSM','MRVL','LRCX','AMAT'];
 const POLL_MS = 60000;
 const SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 
@@ -650,7 +650,7 @@ function trendFilter(price, m) {
   if (!aboveSMA200 && aboveSMA50) return { regime: 'recovery', cap: 70, label: '🔵 Recovery' };
   // Below both SMAs
   if (m.roc5 > 0 && aboveSMA20) return { regime: 'bounce', cap: 55, label: '⚡ Bounce' };
-  return { regime: 'downtrend', cap: 45, label: '🔴 Downtrend' };
+  return { regime: 'downtrend', cap: 50, label: '🔴 Downtrend' };
 }
 
 function volScore(vix, vixPrev, fg, ivp, beta = 1) {
@@ -706,12 +706,73 @@ function calcAll(ticker) {
 }
 
 function sig(comp) {
-  if (comp >= 75) return { label: 'STRONG BUY', color: '#00E676', bg: '#00E67612' };
-  if (comp >= 60) return { label: 'BUY', color: '#4CAF50', bg: '#4CAF5012' };
+  if (comp >= 65) return { label: 'STRONG BUY', color: '#00E676', bg: '#00E67612' };
+  if (comp >= 55) return { label: 'BUY', color: '#4CAF50', bg: '#4CAF5012' };
   if (comp >= 45) return { label: 'ACCUMULATE', color: '#FFC107', bg: '#FFC10712' };
   if (comp >= 30) return { label: 'WAIT', color: '#FF9800', bg: '#FF980012' };
   return { label: 'AVOID', color: '#F44336', bg: '#F4433612' };
 }
+
+// ══════════════════════════════════════════════════
+//  CONFLUENCE SCORING (v10.1)
+// ══════════════════════════════════════════════════
+function calcConfluence(ticker) {
+  const p = S.prices[ticker];
+  if (!p || !p.price) return { votes: 0, factors: [] };
+  const m = getTickerMeta(ticker);
+  const price = p.price;
+  let votes = 0;
+  const factors = [];
+  
+  // 1. RSI oversold
+  const rsi = rsiProxy(price, m.sma50, ticker);
+  if (rsi <= 35) { votes++; factors.push('RSI≤35'); }
+  
+  // 2. Near SMA50 support
+  if (m.sma50 > 0) {
+    const d50 = ((price - m.sma50) / m.sma50) * 100;
+    if (d50 > -8 && d50 < 0) { votes++; factors.push('Near SMA50'); }
+  }
+  
+  // 3. Above SMA200
+  if (m.sma200 > 0 && price > m.sma200) { votes++; factors.push('Above SMA200'); }
+  
+  // 4. Momentum stabilizing
+  if (m.roc5 !== undefined && m.roc5 > -3 && m.roc5 < 3 && (m.roc20 === undefined || m.roc20 > -5)) {
+    votes++; factors.push('Stabilizing');
+  }
+  
+  // 5. Volume capitulation
+  const volRatio = m._live?.volumeRatio || 1;
+  if (volRatio > 1.3 && rsi < 45) { votes++; factors.push('Vol+Oversold'); }
+  
+  // 6. Good PEG
+  if (m.pegRatio > 0 && m.pegRatio < 1.5) { votes++; factors.push('PEG<1.5'); }
+  
+  // 7. Earnings beat history
+  if (m._beatRate >= 0.75) { votes++; factors.push('Beats≥75%'); }
+  
+  // 8. 52w range sweet spot
+  if (m.ath > 0 && m.atl > 0 && m.ath > m.atl) {
+    const pos = (price - m.atl) / (m.ath - m.atl);
+    if (pos >= 0.2 && pos <= 0.6) { votes++; factors.push('52w Sweet'); }
+  }
+  
+  // 9. Low volatility
+  if (m.beta && m.beta < 1.5) { votes++; factors.push('Low Vol'); }
+  
+  return { votes, factors };
+}
+
+// Multi-Strategy Model Configs
+const STRATEGIES = {
+  patient: { name: 'Patient', hold: 20, trailStart: 2.5, trailDist: 2.5, stopMult: 1.5, tpPct: 0.25,
+    sizing: { 6: 0.15, 7: 0.30, 8: 0.50, 9: 0.90 }, alloc: 0.40 },
+  hybrid: { name: 'Hybrid', hold: 10, trailStart: 1.5, trailDist: 1.8, stopMult: 1.2, tpPct: 0.12,
+    sizing: { 6: 0.20, 7: 0.35, 8: 0.55, 9: 0.90 }, alloc: 0.35 },
+  shortterm: { name: 'ShortTerm', hold: 10, trailStart: 2.0, trailDist: 2.0, stopMult: 1.5, tpPct: 0.15,
+    sizing: { 6: 0.15, 7: 0.30, 8: 0.50, 9: 0.90 }, alloc: 0.25 },
+};
 
 // ══════════════════════════════════════════════════
 //  FINNHUB API
