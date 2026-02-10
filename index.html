@@ -364,9 +364,8 @@ let S = {
   positions: [], // { id, ticker, shares, entryPrice, entryDate, stopLoss, trailStop, trailHigh, takeProfit, maxExitDate, strategy, signalAtEntry, confluenceVotes }
   tradeHistory: [], // { id, ticker, shares, entryPrice, exitPrice, entryDate, exitDate, pnl, pnlPercent, signalAtEntry, exitReason }
   
-  // Auto trading
+  // Auto trading — all 3 strategies run simultaneously
   autoTradeEnabled: JSON.parse(localStorage.getItem('ares_auto_trade') || 'true'),
-  activeStrategy: localStorage.getItem('ares_strategy') || 'patient',
   lastAutoTradeCheck: 0,
   
   // Performance tracking
@@ -1582,105 +1581,86 @@ function toggleAutoTrade() {
   updateNumbers();
 }
 
-function setStrategy(name) {
-  S.activeStrategy = name;
-  localStorage.setItem('ares_strategy', name);
-  buildStructure();
-  updateNumbers();
-}
-
-// Check for new entry signals and auto-open positions
+// Check for new entry signals — runs ALL 3 strategies simultaneously
 function autoTradeEntry() {
   if (!S.autoTradeEnabled) return;
   
-  const strat = STRATEGIES[S.activeStrategy];
-  if (!strat) return;
-  
-  // Allocation for this strategy
-  const stratCapital = S.portfolio.startingCapital * strat.alloc;
-  
-  for (const ticker of S.tickers) {
-    // Skip if already have a position in this ticker
-    if (S.positions.some(p => p.ticker === ticker)) continue;
+  for (const [stratKey, strat] of Object.entries(STRATEGIES)) {
+    const stratCapital = S.portfolio.startingCapital * strat.alloc;
     
-    const p = S.prices[ticker];
-    if (!p?.price) continue;
-    
-    const conf = calcConfluence(ticker);
-    if (conf.votes < 6) continue; // Need 6/9 minimum
-    
-    const sc = calcAll(ticker);
-    if (!sc || sc.comp < 45) continue; // Composite must be at least ACCUMULATE
-    
-    // Check macro filters
-    const spyChg = S.market.sp500Prev ? ((S.market.sp500 - S.market.sp500Prev) / S.market.sp500Prev * 100) : 0;
-    if (spyChg < -3) continue; // Skip in crash
-    
-    // Check earnings proximity (skip within 7 days)
-    if (sc.dte != null && sc.dte >= 0 && sc.dte <= 7) continue;
-    
-    // Position sizing by confluence
-    const sizePct = strat.sizing[Math.min(conf.votes, 9)] || strat.sizing[6];
-    const positionValue = stratCapital * sizePct;
-    
-    if (positionValue > S.portfolio.cash) continue; // Not enough cash
-    if (positionValue < 50) continue; // Min $50 position
-    
-    const shares = Math.floor(positionValue / p.price);
-    if (shares < 1) continue;
-    
-    // Calculate ATR proxy from price (rough: ~2% of price for large caps)
-    const atrProxy = p.price * 0.02;
-    
-    const stopLoss = p.price - (strat.stopMult * atrProxy);
-    const takeProfit = p.price * (1 + strat.tpPct);
-    const trailActivation = p.price + (strat.trailStart * atrProxy);
-    
-    // Calculate max exit date
-    const entryDate = new Date();
-    const maxExitDate = new Date(entryDate);
-    maxExitDate.setDate(maxExitDate.getDate() + strat.hold + (strat.hold * 2 / 5)); // add weekends roughly
-    
-    const position = {
-      id: Date.now() + Math.random(),
-      ticker,
-      shares,
-      entryPrice: p.price,
-      entryDate: entryDate.toISOString(),
-      stopLoss,
-      trailStop: null, // activates after trailActivation
-      trailHigh: p.price,
-      trailActivation,
-      takeProfit,
-      maxExitDate: maxExitDate.toISOString(),
-      strategy: S.activeStrategy,
-      signalAtEntry: sig(sc.comp).label,
-      confluenceVotes: conf.votes,
-      confluenceFactors: conf.factors.join(', '),
-      atrProxy
-    };
-    
-    S.positions.push(position);
-    S.portfolio.cash -= shares * p.price;
-    
-    // Save to Supabase
-    if (S.supabase) {
-      S.supabase.insert('paper_trades', {
-        ticker: ticker,
-        side: 'buy',
-        entry_price: p.price,
-        entry_score: sc.comp,
-        entry_signal: sig(sc.comp).label,
+    for (const ticker of S.tickers) {
+      // Skip if already have a position in this ticker FOR THIS STRATEGY
+      if (S.positions.some(p => p.ticker === ticker && p.strategy === stratKey)) continue;
+      
+      const p = S.prices[ticker];
+      if (!p?.price) continue;
+      
+      const conf = calcConfluence(ticker);
+      if (conf.votes < 6) continue;
+      
+      const sc = calcAll(ticker);
+      if (!sc || sc.comp < 45) continue;
+      
+      // Macro filters
+      const spyChg = S.market.sp500Prev ? ((S.market.sp500 - S.market.sp500Prev) / S.market.sp500Prev * 100) : 0;
+      if (spyChg < -3) continue;
+      
+      // Skip within 7 days of earnings
+      if (sc.dte != null && sc.dte >= 0 && sc.dte <= 7) continue;
+      
+      // Position sizing by confluence
+      const sizePct = strat.sizing[Math.min(conf.votes, 9)] || strat.sizing[6];
+      const positionValue = stratCapital * sizePct;
+      
+      if (positionValue > S.portfolio.cash) continue;
+      if (positionValue < 50) continue;
+      
+      const shares = Math.floor(positionValue / p.price);
+      if (shares < 1) continue;
+      
+      const atrProxy = p.price * 0.02;
+      const stopLoss = p.price - (strat.stopMult * atrProxy);
+      const takeProfit = p.price * (1 + strat.tpPct);
+      const trailActivation = p.price + (strat.trailStart * atrProxy);
+      
+      const entryDate = new Date();
+      const maxExitDate = new Date(entryDate);
+      maxExitDate.setDate(maxExitDate.getDate() + strat.hold + Math.ceil(strat.hold * 2 / 5));
+      
+      const position = {
+        id: Date.now() + Math.random(),
+        ticker,
         shares,
-        stop_loss: stopLoss,
-        take_profit: takeProfit,
-        status: 'open',
-        notes: `Auto: ${S.activeStrategy} | ${conf.votes}/9 confluence | Factors: ${conf.factors.join(', ')}`
-      });
-      savePortfolio();
+        entryPrice: p.price,
+        entryDate: entryDate.toISOString(),
+        stopLoss,
+        trailStop: null,
+        trailHigh: p.price,
+        trailActivation,
+        takeProfit,
+        maxExitDate: maxExitDate.toISOString(),
+        strategy: stratKey,
+        signalAtEntry: sig(sc.comp).label,
+        confluenceVotes: conf.votes,
+        confluenceFactors: conf.factors.join(', '),
+        atrProxy
+      };
+      
+      S.positions.push(position);
+      S.portfolio.cash -= shares * p.price;
+      
+      if (S.supabase) {
+        S.supabase.insert('paper_trades', {
+          ticker, side: 'buy', entry_price: p.price, entry_score: sc.comp,
+          entry_signal: sig(sc.comp).label, shares, stop_loss: stopLoss,
+          take_profit: takeProfit, status: 'open',
+          notes: `Auto: ${stratKey} | ${conf.votes}/9 confluence | Factors: ${conf.factors.join(', ')}`
+        });
+        savePortfolio();
+      }
+      
+      console.log(`🤖 AUTO BUY [${strat.name}]: ${ticker} x${shares} @ $${p.price.toFixed(2)} | ${conf.votes}/9 | Stop: $${stopLoss.toFixed(2)} | TP: $${takeProfit.toFixed(2)}`);
     }
-    
-    console.log(`🤖 AUTO BUY: ${ticker} x${shares} @ $${p.price.toFixed(2)} | ${S.activeStrategy} | ${conf.votes}/9 | Stop: $${stopLoss.toFixed(2)} | TP: $${takeProfit.toFixed(2)}`);
   }
 }
 
@@ -2040,26 +2020,30 @@ function buildStructure() {
   html += `<div class="tab-content ${S.currentTab === 'trading' ? 'active' : ''}" id="tab-trading">`;
   
   // Auto trade controls
+  const stratSummary = Object.entries(STRATEGIES).map(([k, s]) => 
+    `<span style="color:var(--text-1)">${s.name}</span> ${Math.round(s.alloc*100)}% · ${s.hold}d hold · ${Math.round(s.tpPct*100)}% TP`
+  ).join(' &nbsp;│&nbsp; ');
+  
   html += `<div class="detail-panel" style="margin-bottom:14px;padding:14px 18px">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
       <div style="display:flex;align-items:center;gap:12px">
-        <span class="mono" style="font-size:12px;color:var(--text-2)">🤖 AUTO TRADING</span>
+        <span class="mono" style="font-size:12px;color:var(--text-2)">🤖 AUTO TRADING — 3 STRATEGIES COMBINED</span>
         <button class="btn btn-sm mono ${S.autoTradeEnabled ? 'btn-green' : 'btn-outline'}" onclick="toggleAutoTrade()">
           ${S.autoTradeEnabled ? '● ENABLED' : '○ DISABLED'}
         </button>
       </div>
       <div style="display:flex;gap:6px">
         ${Object.entries(STRATEGIES).map(([key, s]) => `
-          <button class="btn btn-sm mono ${S.activeStrategy === key ? '' : 'btn-outline'}" onclick="setStrategy('${key}')" style="${S.activeStrategy === key ? 'background:var(--blue)' : ''}">
-            ${s.name} (${Math.round(s.alloc * 100)}%)
-          </button>
+          <span class="mono" style="font-size:10px;padding:4px 10px;border-radius:4px;background:var(--bg-3);color:var(--text-1)">
+            ${s.name} ${Math.round(s.alloc * 100)}%
+          </span>
         `).join('')}
       </div>
     </div>
     <div class="mono" style="font-size:9px;color:var(--text-3);margin-top:8px">
       ${S.autoTradeEnabled 
-        ? `Strategy: <strong style="color:var(--text-1)">${STRATEGIES[S.activeStrategy]?.name}</strong> | Hold: ${STRATEGIES[S.activeStrategy]?.hold}d | Stop: ${STRATEGIES[S.activeStrategy]?.stopMult}x ATR | TP: ${Math.round(STRATEGIES[S.activeStrategy]?.tpPct * 100)}% | Trail: ${STRATEGIES[S.activeStrategy]?.trailStart}x ATR → ${STRATEGIES[S.activeStrategy]?.trailDist}x ATR | Min 6/9 confluence`
-        : 'Enable to auto-open and auto-close paper positions based on confluence signals and exit rules'}
+        ? stratSummary + ' &nbsp;│&nbsp; Min 6/9 confluence &nbsp;│&nbsp; Same signal → 3 positions (different exit rules)'
+        : 'Enable to auto-run all 3 strategies simultaneously with independent entry/exit management'}
     </div>
   </div>`;
   
@@ -2660,7 +2644,6 @@ window.addTicker = addTicker;
 window.removeTicker = removeTicker;
 window.hideSearch = hideSearch;
 window.toggleAutoTrade = toggleAutoTrade;
-window.setStrategy = setStrategy;
 window.openBuyModal = openBuyModal;
 window.closeBuyModal = closeBuyModal;
 window.executeBuy = executeBuy;
