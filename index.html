@@ -1046,9 +1046,9 @@ async function pollFinnhub() {
       const existing = S.prices[sym] || {};
       const wsAge = existing?.lastTrade ? (Date.now() - existing.lastTrade) : 999999;
       if (wsAge > 30000) {
-        S.prices[sym] = { ...existing, price: q.c, prevClose: q.pc, high: q.h, low: q.l, open: q.o, source: 'finnhub-rest' };
+        S.prices[sym] = { ...existing, price: q.c, prevClose: q.pc, high: q.h, low: q.l, open: q.o, source: 'finnhub-rest', lastUpdated: Date.now() };
       } else {
-        S.prices[sym] = { ...existing, prevClose: q.pc, high: Math.max(q.h || 0, existing.high || 0), low: Math.min(q.l || 999999, existing.low || 999999), open: q.o };
+        S.prices[sym] = { ...existing, prevClose: q.pc, high: Math.max(q.h || 0, existing.high || 0), low: Math.min(q.l || 999999, existing.low || 999999), open: q.o, lastUpdated: Date.now() };
       }
     }
     
@@ -1059,7 +1059,7 @@ async function pollFinnhub() {
   
   S.lastPoll = new Date();
   S.refreshCount++;
-  S.countdown = 60;
+  S.countdown = POLL_MS / 1000;
   
   updateNumbers();
   updatePositionPnL();
@@ -2508,7 +2508,16 @@ function updateNumbers() {
     if (badge) { badge.textContent = s.label; badge.style.background = s.bg; badge.style.color = s.color; badge.style.border = `1px solid ${s.color}25`; }
     
     const wsIcon = document.getElementById(`ws-icon-${t}`);
-    if (wsIcon) wsIcon.textContent = p.source === 'finnhub-ws' ? '⚡' : '';
+    if (wsIcon) {
+      if (p.source === 'finnhub-ws') {
+        wsIcon.textContent = '⚡';
+        wsIcon.title = 'Real-time WebSocket';
+      } else {
+        const ago = p.lastUpdated ? Math.round((Date.now() - p.lastUpdated) / 1000) : 0;
+        wsIcon.textContent = ago > 30 ? `${ago}s` : '';
+        wsIcon.title = `REST poll — ${ago}s ago`;
+      }
+    }
     
     sumComp += sc.comp; n++;
   }
