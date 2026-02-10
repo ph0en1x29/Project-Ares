@@ -2735,6 +2735,29 @@ window.executeClose = executeClose;
 // ══════════════════════════════════════════════════
 //  BOOTSTRAP
 // ══════════════════════════════════════════════════
+async function saveIntradayPrices() {
+  if (!S.supabase || !isMarketHours()) return;
+  const rows = [];
+  for (const t of S.tickers) {
+    const p = S.prices[t];
+    if (!p?.price) continue;
+    rows.push({
+      ticker: t,
+      price: p.price,
+      high: p.high || p.price,
+      low: p.low || p.price,
+      volume: null,
+      source: p.source || 'unknown',
+      captured_at: new Date().toISOString(),
+    });
+  }
+  if (rows.length > 0) {
+    for (const row of rows) {
+      await S.supabase.insert('intraday_prices', row);
+    }
+  }
+}
+
 async function init() {
   // Load config from server (API keys)
   await loadServerConfig();
@@ -2776,6 +2799,7 @@ async function init() {
   setInterval(fetchHistoricalRSI, 600000);
   setInterval(fetchOptionsData, 900000);
   setInterval(fetchNewsSentiment, 1800000); // News every 30 min
+  setInterval(saveIntradayPrices, 300000); // Intraday snapshots every 5 min
   
   // Countdown timer
   setInterval(() => {
