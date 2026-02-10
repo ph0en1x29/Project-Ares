@@ -2589,6 +2589,9 @@ function updateDetailNumbers() {
     { l: 'Vol Ratio', v: m._live?.volumeRatio ? `${m._live.volumeRatio.toFixed(2)}x avg` : '—', w: m._live?.volumeRatio > 2 },
     { l: 'Avg Vol 20d', v: m._live?.avgVolume20 ? (m._live.avgVolume20 / 1e6).toFixed(1) + 'M' : '—' },
     { l: 'News Sent.', v: m._live?.newsSentiment ? `${m._live.newsSentiment} (${m._live.newsSentiment > 55 ? 'Bullish' : m._live.newsSentiment < 45 ? 'Bearish' : 'Neutral'})` : '—', w: m._live?.newsSentiment < 40 },
+    { l: 'Inst. Flow', v: m._live?.instOwnership ? `${m._live.instOwnership.netChange > 0 ? '↑' : m._live.instOwnership.netChange < 0 ? '↓' : '—'} ${m._live.instOwnership.holders} holders` : '—', w: m._live?.instOwnership?.netChange < 0 },
+    { l: 'Insider', v: m._live?.insiderSentiment ? `B:${m._live.insiderSentiment.buys} S:${m._live.insiderSentiment.sells}` : '—', w: m._live?.insiderSentiment?.sells > m._live?.insiderSentiment?.buys },
+    { l: 'Short Int.', v: m._live?.shortInterest ? (m._live.shortInterest.shares / 1e6).toFixed(1) + 'M' : '—' },
     { l: 'Source', v: p.source === 'finnhub-ws' ? '⚡ Real-time' : '📊 REST' },
   ];
   
@@ -2735,6 +2738,106 @@ window.executeClose = executeClose;
 // ══════════════════════════════════════════════════
 //  BOOTSTRAP
 // ══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
+//  DATA COLLECTION: Institutional, Insider, Short Interest
+// ══════════════════════════════════════════════════
+async function fetchInstitutionalOwnership() {
+  if (!S.supabase) return;
+  for (const t of S.tickers) {
+    try {
+      const d = await fhGet(`/institutional-ownership?symbol=${t}&limit=10`);
+      if (!d?.ownership?.length) continue;
+      
+      if (!S.tickerData[t]) S.tickerData[t] = getTickerMeta(t);
+      if (!S.tickerData[t]._live) S.tickerData[t]._live = {};
+      
+      // Calculate net institutional change
+      const totalShares = d.ownership.reduce((sum, o) => sum + (o.share || 0), 0);
+      const totalChange = d.ownership.reduce((sum, o) => sum + (o.change || 0), 0);
+      S.tickerData[t]._live.instOwnership = { totalShares, netChange: totalChange, holders: d.ownership.length };
+      
+      // Store top holders
+      for (const o of d.ownership.slice(0, 5)) {
+        await S.supabase.insert('institutional_ownership', {
+          ticker: t,
+          owner_name: o.name || 'Unknown',
+          shares: o.share || 0,
+          change_pct: o.change || 0,
+          filing_date: o.filingDate || null,
+        });
+      }
+    } catch { continue; }
+  }
+}
+
+async function fetchInsiderTrades() {
+  if (!S.supabase) return;
+  for (const t of S.tickers) {
+    try {
+      const d = await fhGet(`/stock/insider-transactions?symbol=${t}`);
+      if (!d?.data?.length) continue;
+      
+      if (!S.tickerData[t]) S.tickerData[t] = getTickerMeta(t);
+      if (!S.tickerData[t]._live) S.tickerData[t]._live = {};
+      
+      // Recent insider sentiment: net buys vs sells in last 90 days
+      const recent = d.data.filter(tx => {
+        const txDate = new Date(tx.transactionDate);
+        return (Date.now() - txDate.getTime()) < 90 * 86400000;
+      });
+      const buys = recent.filter(tx => tx.transactionCode === 'P' || tx.transactionCode === 'A');
+      const sells = recent.filter(tx => tx.transactionCode === 'S');
+      S.tickerData[t]._live.insiderSentiment = {
+        buys: buys.length,
+        sells: sells.length,
+        netBuyValue: buys.reduce((s, tx) => s + (Math.abs(tx.share || 0) * (tx.transactionPrice || 0)), 0) -
+                     sells.reduce((s, tx) => s + (Math.abs(tx.share || 0) * (tx.transactionPrice || 0)), 0),
+      };
+      
+      // Store recent transactions
+      for (const tx of d.data.slice(0, 10)) {
+        await S.supabase.insert('insider_trades', {
+          ticker: t,
+          insider_name: tx.name || 'Unknown',
+          position: tx.position || '',
+          transaction_type: tx.transactionCode || '',
+          shares: Math.abs(tx.share || 0),
+          price: tx.transactionPrice || 0,
+          value: Math.abs(tx.share || 0) * (tx.transactionPrice || 0),
+          transaction_date: tx.transactionDate || null,
+          filing_date: tx.filingDate || null,
+        });
+      }
+    } catch { continue; }
+  }
+}
+
+async function fetchShortInterest() {
+  if (!S.supabase) return;
+  for (const t of S.tickers) {
+    try {
+      // Finnhub short interest endpoint
+      const d = await fhGet(`/stock/short-interest?symbol=${t}`);
+      if (!d?.data?.length) continue;
+      
+      const latest = d.data[0];
+      if (!S.tickerData[t]) S.tickerData[t] = getTickerMeta(t);
+      if (!S.tickerData[t]._live) S.tickerData[t]._live = {};
+      
+      S.tickerData[t]._live.shortInterest = {
+        shares: latest.shortInterest || 0,
+        date: latest.date,
+      };
+      
+      await S.supabase.insert('short_interest', {
+        ticker: t,
+        short_interest: latest.shortInterest || 0,
+        report_date: latest.date || null,
+      });
+    } catch { continue; }
+  }
+}
+
 async function saveIntradayPrices() {
   if (!S.supabase || !isMarketHours()) return;
   const rows = [];
@@ -2792,6 +2895,8 @@ async function init() {
   });
   fetchOptionsData();
   fetchNewsSentiment();
+  // Delayed start for new data sources (avoid Finnhub rate limit on init)
+  setTimeout(() => { fetchInstitutionalOwnership(); fetchInsiderTrades(); fetchShortInterest(); }, 30000);
   
   // Polling intervals
   setInterval(pollFinnhub, POLL_MS);
@@ -2800,6 +2905,9 @@ async function init() {
   setInterval(fetchOptionsData, 900000);
   setInterval(fetchNewsSentiment, 1800000); // News every 30 min
   setInterval(saveIntradayPrices, 300000); // Intraday snapshots every 5 min
+  setInterval(fetchInstitutionalOwnership, 3600000); // Institutional every 1h
+  setInterval(fetchInsiderTrades, 3600000); // Insider trades every 1h
+  setInterval(fetchShortInterest, 3600000); // Short interest every 1h
   
   // Countdown timer
   setInterval(() => {
