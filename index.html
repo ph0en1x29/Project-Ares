@@ -309,7 +309,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:12px;
 
 <script>
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROJECT ARES v10.1 — FULL TRADING PLATFORM
+//  PROJECT ARES v11 — FULL TRADING PLATFORM
 //  Phase 1: Dynamic Search + Scoring
 //  Phase 2: Supabase Integration
 //  Phase 3: Paper Trading
@@ -762,10 +762,38 @@ function calcConfluence(ticker) {
     if (pos >= 0.2 && pos <= 0.6) { votes++; factors.push('52w Sweet'); }
   }
   
-  // 9. Low volatility
-  if (m.beta && m.beta < 1.5) { votes++; factors.push('Low Vol'); }
+  // 9. Low volatility entry
+  const atrPct = m._live?.atrPct || (m.beta ? m.beta * 1.5 : 2);
+  if (atrPct < 4) { votes++; factors.push('Low Vol'); }
   
-  return { votes, factors };
+  // 10. V-Bounce pattern (v11) — does this stock bounce after RSI dips?
+  if (m._live?.vBounce === true) { votes++; factors.push('V-Bounce ✓'); }
+  
+  return { votes, factors, atrPct };
+}
+
+// ══════════════════════════════════════════════════
+//  v11: ADAPTIVE STOPS + VOL TIERS
+// ══════════════════════════════════════════════════
+function getVolTier(atrPct) {
+  if (atrPct > 2.5) return 'high';   // NVDA, AMD, MU
+  if (atrPct > 1.5) return 'mid';    // AMZN, GOOGL, META, AVGO
+  return 'low';                        // AAPL, MSFT
+}
+
+function getAdaptiveParams(volTier, strat) {
+  const s = { ...strat };
+  if (volTier === 'high') {
+    s.stopMult = Math.max(s.stopMult, 2.5);
+    s.trailDist = Math.max(s.trailDist, 3.0);
+    s.trailStart = Math.max(s.trailStart, 3.0);
+  } else if (volTier === 'low') {
+    s.stopMult = Math.min(s.stopMult, 1.2);
+    s.tpPct = Math.min(s.tpPct, 0.12);
+    s.trailStart = Math.min(s.trailStart, 1.5);
+    s.trailDist = Math.min(s.trailDist, 1.5);
+  }
+  return s;
 }
 
 // Multi-Strategy Model Configs
@@ -1164,6 +1192,33 @@ async function fetchHistoricalRSI(ticker = null) {
       // ATL from data if not set
       if (!S.tickerData[t].atl || S.tickerData[t].atl === 0) {
         S.tickerData[t].atl = Math.min(...clean);
+      }
+      
+      // v11: ATR% for vol tier
+      if (clean.length >= 20) {
+        const dailyReturns = [];
+        for (let i = 1; i < clean.length; i++) {
+          dailyReturns.push(Math.abs((clean[i] - clean[i-1]) / clean[i-1]) * 100);
+        }
+        S.tickerData[t]._live.atrPct = Math.round(dailyReturns.slice(-20).reduce((a,b) => a+b, 0) / 20 * 100) / 100;
+      }
+      
+      // v11: V-Bounce detection — does stock recover >5% within 10 days after RSI < 35?
+      if (clean.length >= 100) {
+        let bounces = 0, dips = 0;
+        for (let i = 30; i < clean.length - 10; i++) {
+          // Simple RSI proxy: if price is >8% below recent 50-day peak
+          const peak50 = Math.max(...clean.slice(Math.max(0, i-50), i));
+          const dd = (peak50 - clean[i]) / peak50 * 100;
+          if (dd > 8) {
+            dips++;
+            const maxNext10 = Math.max(...clean.slice(i+1, i+11));
+            if ((maxNext10 - clean[i]) / clean[i] > 0.05) bounces++;
+            i += 10; // skip ahead
+          }
+        }
+        S.tickerData[t]._live.vBounce = dips >= 3 ? (bounces / dips >= 0.6) : null;
+        S.tickerData[t]._live.vBounceRate = dips >= 3 ? Math.round(bounces / dips * 100) : null;
       }
     } catch (e) { continue; }
   }
@@ -1618,14 +1673,20 @@ function autoTradeEntry() {
       const shares = Math.floor(positionValue / p.price);
       if (shares < 1) continue;
       
-      const atrProxy = p.price * 0.02;
-      const stopLoss = p.price - (strat.stopMult * atrProxy);
-      const takeProfit = p.price * (1 + strat.tpPct);
-      const trailActivation = p.price + (strat.trailStart * atrProxy);
+      // v11: Adaptive stops based on volatility tier
+      const m = getTickerMeta(ticker);
+      const atrPct = m._live?.atrPct || 2;
+      const atrProxy = p.price * (atrPct / 100);
+      const volTier = getVolTier(atrPct);
+      const adapted = getAdaptiveParams(volTier, strat);
+      
+      const stopLoss = p.price - (adapted.stopMult * atrProxy);
+      const takeProfit = p.price * (1 + adapted.tpPct);
+      const trailActivation = p.price + (adapted.trailStart * atrProxy);
       
       const entryDate = new Date();
       const maxExitDate = new Date(entryDate);
-      maxExitDate.setDate(maxExitDate.getDate() + strat.hold + Math.ceil(strat.hold * 2 / 5));
+      maxExitDate.setDate(maxExitDate.getDate() + adapted.hold + Math.ceil(adapted.hold * 2 / 5));
       
       const position = {
         id: Date.now() + Math.random(),
@@ -1643,7 +1704,8 @@ function autoTradeEntry() {
         signalAtEntry: sig(sc.comp).label,
         confluenceVotes: conf.votes,
         confluenceFactors: conf.factors.join(', '),
-        atrProxy
+        atrProxy,
+        volTier
       };
       
       S.positions.push(position);
@@ -1703,7 +1765,9 @@ function autoTradeExit() {
       }
       if (pos.trailHigh >= pos.trailActivation) {
         const strat = STRATEGIES[pos.strategy] || STRATEGIES.patient;
-        const trailDist = (pos.atrProxy || pos.entryPrice * 0.02) * strat.trailDist;
+        const volTier = pos.volTier || 'mid';
+        const adapted = getAdaptiveParams(volTier, strat);
+        const trailDist = (pos.atrProxy || pos.entryPrice * 0.02) * adapted.trailDist;
         pos.trailStop = pos.trailHigh - trailDist;
       }
     }
@@ -1856,7 +1920,7 @@ function buildStructure() {
   // ── HEADER ──
   html += `<div class="header">
     <div class="header-left">
-      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v10.1</div>
+      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v11</div>
       <h1 class="mono">Entry Signal Engine</h1>
       <div class="status-row mono" id="status-row">
         <span class="dot ${S.wsConnected ? 'ws' : S.lastPoll ? 'live' : 'off'}" id="status-dot"></span>
@@ -2237,7 +2301,7 @@ function buildStructure() {
   
   // ── FOOTER ──
   html += `<div class="footer mono">
-    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v10.1</span> •
+    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v11</span> •
     ${S.wsConnected ? 'Real-time via Finnhub WebSocket' : 'Finnhub REST polling'} •
     Live RSI(14) • Live Fear/Greed Index • Paper Trading • Supabase Integration<br>
     <strong>TECH</strong>: RSI(14), SMA50, SMA200, support/resistance •
