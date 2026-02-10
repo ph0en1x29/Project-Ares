@@ -118,7 +118,7 @@ body {
 
 /* ── WEIGHTS ── */
 .weights-panel { background:var(--bg-2); border:1px solid var(--border); border-radius:10px; padding:10px 14px; margin-bottom:12px; }
-.weights-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+.weights-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:14px; }
 @media(max-width:600px) { .weights-grid { grid-template-columns:repeat(2,1fr); } }
 .weight-item label { display:flex; justify-content:space-between; font-size:9px; margin-bottom:3px; }
 input[type="range"] { -webkit-appearance:none; width:100%; height:3px; background:var(--bg-3); border-radius:2px; outline:none; cursor:pointer; }
@@ -309,7 +309,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:12px;
 
 <script>
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROJECT ARES v4.0 — FULL TRADING PLATFORM
+//  PROJECT ARES v5.0 — FULL TRADING PLATFORM
 //  Phase 1: Dynamic Search + Scoring
 //  Phase 2: Supabase Integration
 //  Phase 3: Paper Trading
@@ -350,7 +350,7 @@ let S = {
   currentTab: (()=>{const p=window.location.pathname.replace(/^\/+/,'').split('/')[0];return ['signals','trading','performance'].includes(p)?p:'signals'})(),
   selected: 'NVDA',
   prevSelected: null,
-  weights: JSON.parse(localStorage.getItem('signal_weights') || '{"technical":30,"value":25,"catalyst":25,"volatility":20}'),
+  weights: JSON.parse(localStorage.getItem('signal_weights') || '{"technical":25,"value":20,"catalyst":20,"volatility":15,"momentum":20}'),
   
   // Polling state
   lastPoll: null,
@@ -468,7 +468,11 @@ function getTickerMeta(ticker) {
     sentiment: 50,
     beta: 1,
     notes: '',
-    _live: {}
+    _live: {},
+    sparkData: [], // last 30 daily closes for sparkline
+    sma20: 0,
+    roc5: 0, // 5-day rate of change %
+    roc20: 0, // 20-day rate of change %
   };
 }
 
@@ -588,6 +592,61 @@ function catScore(m) {
   return { score: Math.min(s, 100), dte: null };
 }
 
+function momentumScore(price, m) {
+  let s = 0;
+  
+  // Rate of change (5-day)
+  if (m.roc5 > 5) s += 10;       // strong short-term momentum
+  else if (m.roc5 > 2) s += 15;  // moderate (not overextended)
+  else if (m.roc5 > 0) s += 20;  // slight positive
+  else if (m.roc5 > -2) s += 12; // slight pullback in uptrend can be ok
+  else if (m.roc5 > -5) s += 5;
+  // else 0 — strong short-term decline
+  
+  // Rate of change (20-day)
+  if (m.roc20 > 10) s += 10;      // extended
+  else if (m.roc20 > 5) s += 20;  // healthy momentum
+  else if (m.roc20 > 0) s += 15;
+  else if (m.roc20 > -5) s += 8;
+  else s += 3;
+  
+  // Position in 52-week range
+  if (m.ath > 0 && m.atl > 0 && m.ath > m.atl) {
+    const range = m.ath - m.atl;
+    const pos = (price - m.atl) / range; // 0 = at low, 1 = at high
+    // Sweet spot: 0.3-0.6 (not at bottom, not overextended)
+    if (pos >= 0.3 && pos <= 0.6) s += 25;
+    else if (pos >= 0.2 && pos <= 0.7) s += 18;
+    else if (pos < 0.2) s += 10; // near bottom, could be falling knife
+    else s += 5; // near top
+  }
+  
+  // Price vs SMA20 (short-term trend)
+  if (m.sma20 > 0) {
+    const d20 = ((price - m.sma20) / m.sma20) * 100;
+    if (d20 > 0 && d20 < 5) s += 20;  // above but not extended
+    else if (d20 >= 5) s += 10;        // extended above
+    else if (d20 > -3) s += 15;        // slight pullback to SMA
+    else s += 5;                        // well below
+  }
+  
+  return Math.min(s, 100);
+}
+
+// Trend filter — prevents catching falling knives
+function trendFilter(price, m) {
+  const aboveSMA50 = m.sma50 > 0 ? price > m.sma50 : true;
+  const aboveSMA200 = m.sma200 > 0 ? price > m.sma200 : true;
+  const aboveSMA20 = m.sma20 > 0 ? price > m.sma20 : true;
+  
+  if (aboveSMA50 && aboveSMA200) return { regime: 'uptrend', cap: 100, label: '🟢 Uptrend' };
+  if (aboveSMA200 && !aboveSMA50) return { regime: 'pullback', cap: 75, label: '🟡 Pullback' };
+  if (!aboveSMA200 && aboveSMA50) return { regime: 'recovery', cap: 70, label: '🔵 Recovery' };
+  // Below both SMAs
+  if (m.roc5 > 0 && aboveSMA20) return { regime: 'bounce', cap: 55, label: '⚡ Bounce' };
+  return { regime: 'downtrend', cap: 45, label: '🔴 Downtrend' };
+}
+
 function volScore(vix, vixPrev, fg, ivp, beta = 1) {
   let s = 0;
   
@@ -626,11 +685,18 @@ function calcAll(ticker) {
   const v = valScore(p.price, m);
   const c = catScore(m);
   const vol = volScore(S.market.vix, S.market.vixPrev, S.market.fearGreed, m.ivPctile || 50, m.beta);
+  const mom = momentumScore(p.price, m);
+  const trend = trendFilter(p.price, m);
   
   const w = S.weights;
-  const comp = (t.score * w.technical + v * w.value + c.score * w.catalyst + vol * w.volatility) / 100;
+  // 5-factor weighted composite (weights sum to 100)
+  const totalW = w.technical + w.value + w.catalyst + w.volatility + (w.momentum || 0);
+  const rawComp = (t.score * w.technical + v * w.value + c.score * w.catalyst + vol * w.volatility + mom * (w.momentum || 0)) / totalW;
   
-  return { tech: t.score, rsi: t.rsi, val: v, cat: c.score, dte: c.dte, vol, comp };
+  // Apply trend filter cap
+  const comp = Math.min(rawComp, trend.cap);
+  
+  return { tech: t.score, rsi: t.rsi, val: v, cat: c.score, dte: c.dte, vol, mom, trend, rawComp, comp };
 }
 
 function sig(comp) {
@@ -970,8 +1036,32 @@ async function fetchHistoricalRSI(ticker = null) {
       S.tickerData[t]._live.rsi = Math.round(rsi * 10) / 10;
       
       // SMA from historical data
+      if (clean.length >= 20) {
+        S.tickerData[t].sma20 = Math.round(clean.slice(-20).reduce((a, b) => a + b, 0) / 20 * 100) / 100;
+      }
       if (clean.length >= 50) {
         S.tickerData[t].sma50 = Math.round(clean.slice(-50).reduce((a, b) => a + b, 0) / 50 * 100) / 100;
+      }
+      // SMA200 — only if we have enough data (we fetch 90 days, so estimate)
+      if (clean.length >= 60) {
+        // Use available data as best approximation
+        S.tickerData[t].sma200 = S.tickerData[t].sma200 || Math.round(clean.reduce((a, b) => a + b, 0) / clean.length * 100) / 100;
+      }
+      
+      // Rate of change
+      if (clean.length >= 6) {
+        S.tickerData[t].roc5 = Math.round(((clean[clean.length-1] - clean[clean.length-6]) / clean[clean.length-6]) * 10000) / 100;
+      }
+      if (clean.length >= 21) {
+        S.tickerData[t].roc20 = Math.round(((clean[clean.length-1] - clean[clean.length-21]) / clean[clean.length-21]) * 10000) / 100;
+      }
+      
+      // Spark data — last 30 closes for sparkline
+      S.tickerData[t].sparkData = clean.slice(-30);
+      
+      // ATL from data if not set
+      if (!S.tickerData[t].atl || S.tickerData[t].atl === 0) {
+        S.tickerData[t].atl = Math.min(...clean);
       }
     } catch (e) { continue; }
   }
@@ -1353,7 +1443,7 @@ function buildStructure() {
   // ── HEADER ──
   html += `<div class="header">
     <div class="header-left">
-      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v4.0</div>
+      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v5.0</div>
       <h1 class="mono">Entry Signal Engine</h1>
       <div class="status-row mono" id="status-row">
         <span class="dot ${S.wsConnected ? 'ws' : S.lastPoll ? 'live' : 'off'}" id="status-dot"></span>
@@ -1423,9 +1513,9 @@ function buildStructure() {
   html += `<div class="weights-panel">
     <div class="mono" style="font-size:8px;color:var(--text-3);letter-spacing:1px;margin-bottom:8px">FACTOR WEIGHTS</div>
     <div class="weights-grid">
-      ${['technical', 'value', 'catalyst', 'volatility'].map((k, i) => {
-        const colors = ['var(--blue)', 'var(--purple)', 'var(--amber)', 'var(--red)'];
-        const labels = ['TECHNICAL', 'VALUE', 'CATALYST', 'VOLATILITY'];
+      ${['technical', 'value', 'catalyst', 'volatility', 'momentum'].map((k, i) => {
+        const colors = ['var(--blue)', 'var(--purple)', 'var(--amber)', 'var(--red)', 'var(--green)'];
+        const labels = ['TECHNICAL', 'VALUE', 'CATALYST', 'VOLATILITY', 'MOMENTUM'];
         return `<div class="weight-item">
           <label class="mono"><span style="color:${colors[i]}">${labels[i]}</span><span style="color:var(--text-0);font-weight:700" id="w-val-${k}">${S.weights[k]}%</span></label>
           <input type="range" min="5" max="55" value="${S.weights[k]}" id="w-slider-${k}" oninput="adjustWeight('${k}',parseInt(this.value))">
@@ -1453,16 +1543,20 @@ function buildStructure() {
         <span class="mono price live-num" id="price-${t}">—</span>
         <span class="mono day-chg live-num" id="chg-${t}">—</span>
       </div>
-      <div class="meta-row mono">
-        <span>ATH <span id="dd-${t}">—</span></span>
-        <span>RSI <span id="rsi-${t}">—</span></span>
-        <span>PEG ${(m.pegRatio || 1).toFixed(1)}</span>
-        <span>E: <span id="dte-${t}">—</span></span>
+      <div id="spark-${t}" style="margin:-2px 0 6px;height:32px;opacity:0.7"></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span class="mono" style="font-size:8px" id="trend-${t}">—</span>
+        <div class="meta-row mono" style="margin:0">
+          <span>RSI <span id="rsi-${t}">—</span></span>
+          <span>PEG ${(m.pegRatio || 1).toFixed(1)}</span>
+          <span>E: <span id="dte-${t}">—</span></span>
+        </div>
       </div>
       <div class="score-bar"><div class="bar-hdr mono"><span>TECH</span><span class="bv" id="ts-${t}">—</span></div><div class="bar-track"><div class="bar-fill" id="tb-${t}" style="width:0%;background:linear-gradient(90deg,var(--blue)80,var(--blue))"></div></div></div>
       <div class="score-bar"><div class="bar-hdr mono"><span>VALUE</span><span class="bv" id="vs-${t}">—</span></div><div class="bar-track"><div class="bar-fill" id="vb-${t}" style="width:0%;background:linear-gradient(90deg,var(--purple)80,var(--purple))"></div></div></div>
       <div class="score-bar"><div class="bar-hdr mono"><span>CAT</span><span class="bv" id="cs-${t}">—</span></div><div class="bar-track"><div class="bar-fill" id="cb-${t}" style="width:0%;background:linear-gradient(90deg,var(--amber)80,var(--amber))"></div></div></div>
       <div class="score-bar"><div class="bar-hdr mono"><span>VOL</span><span class="bv" id="vos-${t}">—</span></div><div class="bar-track"><div class="bar-fill" id="vob-${t}" style="width:0%;background:linear-gradient(90deg,var(--red)80,var(--red))"></div></div></div>
+      <div class="score-bar"><div class="bar-hdr mono"><span style="color:var(--green)">MOM</span><span class="bv" id="ms-${t}">—</span></div><div class="bar-track"><div class="bar-fill" id="mb-${t}" style="width:0%;background:linear-gradient(90deg,var(--green)80,var(--green))"></div></div></div>
       <div class="composite-row"><span class="mono cl">COMPOSITE</span><span class="mono cv live-num" id="comp-${t}">—</span></div>
       <div class="actions">
         ${hasPosition 
@@ -1493,6 +1587,12 @@ function buildStructure() {
         <div class="score-bar"><div class="bar-hdr mono"><span id="d-val-lbl">VALUE</span><span class="bv" id="d-val-val">—</span></div><div class="bar-track"><div class="bar-fill" id="d-val-bar" style="width:0%;background:linear-gradient(90deg,var(--purple)80,var(--purple))"></div></div></div>
         <div class="score-bar"><div class="bar-hdr mono"><span id="d-cat-lbl">CATALYST</span><span class="bv" id="d-cat-val">—</span></div><div class="bar-track"><div class="bar-fill" id="d-cat-bar" style="width:0%;background:linear-gradient(90deg,var(--amber)80,var(--amber))"></div></div></div>
         <div class="score-bar"><div class="bar-hdr mono"><span id="d-vol-lbl">VOLATILITY</span><span class="bv" id="d-vol-val">—</span></div><div class="bar-track"><div class="bar-fill" id="d-vol-bar" style="width:0%;background:linear-gradient(90deg,var(--red)80,var(--red))"></div></div></div>
+        <div class="score-bar"><div class="bar-hdr mono"><span id="d-mom-lbl" style="color:var(--green)">MOMENTUM</span><span class="bv" id="d-mom-val">—</span></div><div class="bar-track"><div class="bar-fill" id="d-mom-bar" style="width:0%;background:linear-gradient(90deg,var(--green)80,var(--green))"></div></div></div>
+        <div style="margin-top:8px;padding:6px 10px;background:var(--bg-1);border-radius:6px;border:1px solid #141824;display:flex;justify-content:space-between;align-items:center">
+          <span class="mono" style="font-size:8px;color:var(--text-3)">TREND REGIME</span>
+          <span class="mono" style="font-size:11px;font-weight:700" id="d-trend">—</span>
+        </div>
+        <div style="margin-top:4px;font-size:8px;color:var(--text-3)" id="d-trend-note"></div>
       </div>
       <div><div class="mono section-title">DECISION FACTORS</div>
         <div class="factors" id="d-factors">—</div></div>
@@ -1688,7 +1788,7 @@ function buildStructure() {
   
   // ── FOOTER ──
   html += `<div class="footer mono">
-    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v4.0</span> •
+    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v5.0</span> •
     ${S.wsConnected ? 'Real-time via Finnhub WebSocket' : 'Finnhub REST polling'} •
     Live RSI(14) • Live Fear/Greed Index • Paper Trading • Supabase Integration<br>
     <strong>TECH</strong>: RSI(14), SMA50, SMA200, support/resistance •
@@ -1796,6 +1896,27 @@ function renderFactorCorrelation() {
 // ══════════════════════════════════════════════════
 //  UPDATE NUMBERS
 // ══════════════════════════════════════════════════
+function renderSparkline(containerId, data, color) {
+  const el = document.getElementById(containerId);
+  if (!el || !data || data.length < 2) return;
+  const w = el.offsetWidth || 180, h = 32;
+  const min = Math.min(...data), max = Math.max(...data);
+  const range = max - min || 1;
+  const points = data.map((v, i) => `${(i / (data.length - 1)) * w},${h - ((v - min) / range) * (h - 4) - 2}`).join(' ');
+  const lastY = h - ((data[data.length - 1] - min) / range) * (h - 4) - 2;
+  // Gradient fill under the line
+  const fillPoints = `0,${h} ${points} ${w},${h}`;
+  el.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <defs><linearGradient id="sg-${containerId}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${color}" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient></defs>
+    <polygon points="${fillPoints}" fill="url(#sg-${containerId})"/>
+    <polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="${w}" cy="${lastY}" r="2" fill="${color}"/>
+  </svg>`;
+}
+
 function updateNumbers() {
   if (!S.structureBuilt) return;
   
@@ -1838,6 +1959,17 @@ function updateNumbers() {
     setText(`vs-${t}`, sc.val.toFixed(0)); setBar(`vb-${t}`, sc.val);
     setText(`cs-${t}`, sc.cat.toFixed(0)); setBar(`cb-${t}`, sc.cat);
     setText(`vos-${t}`, sc.vol.toFixed(0)); setBar(`vob-${t}`, sc.vol);
+    setText(`ms-${t}`, sc.mom.toFixed(0)); setBar(`mb-${t}`, sc.mom);
+    
+    // Trend indicator
+    const trendEl = document.getElementById(`trend-${t}`);
+    if (trendEl) { trendEl.textContent = sc.trend.label; }
+    
+    // Sparkline (render once, not every tick)
+    if (m.sparkData?.length > 2 && !document.querySelector(`#spark-${t} svg`)) {
+      const sparkColor = dayPos ? 'var(--green-bright)' : 'var(--red-bright)';
+      renderSparkline(`spark-${t}`, m.sparkData, sparkColor);
+    }
     
     const compEl = document.getElementById(`comp-${t}`);
     if (compEl) { compEl.textContent = sc.comp.toFixed(0); compEl.style.color = s.color; }
@@ -1919,6 +2051,11 @@ function updateDetailNumbers() {
     { l: 'P/C Ratio', v: m._live?.pcRatio != null ? m._live.pcRatio.toFixed(2) : '—', w: m._live?.pcRatio > 1.2 },
     { l: 'Call OI', v: m._live?.callOI != null ? m._live.callOI.toLocaleString() : '—' },
     { l: 'Put OI', v: m._live?.putOI != null ? m._live.putOI.toLocaleString() : '—' },
+    { l: 'SMA20', v: m.sma20 > 0 ? `$${m.sma20.toFixed(2)}` : '—', w: p.price < m.sma20 },
+    { l: 'SMA200', v: m.sma200 > 0 ? `$${m.sma200.toFixed(2)}` : '—', w: p.price < m.sma200 },
+    { l: 'ROC 5d', v: m.roc5 ? `${m.roc5 >= 0 ? '+' : ''}${m.roc5.toFixed(2)}%` : '—', w: m.roc5 < -5 },
+    { l: 'ROC 20d', v: m.roc20 ? `${m.roc20 >= 0 ? '+' : ''}${m.roc20.toFixed(2)}%` : '—', w: m.roc20 < -10 },
+    { l: 'Trend', v: sc.trend.label },
     { l: 'Source', v: p.source === 'finnhub-ws' ? '⚡ Real-time' : '📊 REST' },
   ];
   
@@ -1936,13 +2073,32 @@ function updateDetailNumbers() {
   setText('d-cat-val', sc.cat.toFixed(0)); setBar('d-cat-bar', sc.cat);
   setText('d-vol-lbl', `VOLATILITY (×${S.weights.volatility}%)`);
   setText('d-vol-val', sc.vol.toFixed(0)); setBar('d-vol-bar', sc.vol);
+  setText('d-mom-lbl', `MOMENTUM (×${S.weights.momentum || 0}%)`);
+  setText('d-mom-val', sc.mom.toFixed(0)); setBar('d-mom-bar', sc.mom);
+  
+  // Trend regime
+  setText('d-trend', `${sc.trend.label} (cap: ${sc.trend.cap})`);
+  const trendNote = sc.rawComp > sc.trend.cap 
+    ? `⚠️ Raw score ${sc.rawComp.toFixed(0)} capped to ${sc.trend.cap} by trend filter — price is in ${sc.trend.regime}`
+    : `Score within trend cap. Raw: ${sc.rawComp.toFixed(0)}`;
+  setText('d-trend-note', trendNote);
   
   let factors = [];
+  // Trend factor (most important — show first)
+  if (sc.trend.regime === 'downtrend') factors.push('🔴 DOWNTREND — below SMA50 & SMA200. Score capped at 45. Wait for recovery.');
+  else if (sc.trend.regime === 'pullback') factors.push('🟡 Pullback in uptrend — below SMA50 but above SMA200. Could be entry if other factors align.');
+  else if (sc.trend.regime === 'recovery') factors.push('🔵 Recovery attempt — above SMA50 but below SMA200. Watch for confirmation.');
+  else if (sc.trend.regime === 'bounce') factors.push('⚡ Short-term bounce in downtrend — risky, trade small.');
+  else factors.push('🟢 Uptrend — price above both SMAs. Best environment for entries.');
+  
   if (sc.tech >= 60) factors.push('✅ Technically oversold — good entry zone');
   else if (sc.tech >= 40) factors.push('➡️ Technicals moderate');
   else factors.push('⚠️ Could fall further');
   if (sc.val >= 60) factors.push('✅ Strong fundamental value');
   else if (sc.val < 40) factors.push('⚠️ Valuation still elevated');
+  if (sc.mom >= 60) factors.push('✅ Strong momentum — trend is your friend');
+  else if (sc.mom >= 40) factors.push('➡️ Moderate momentum');
+  else factors.push('⚠️ Weak momentum — no follow-through');
   if (sc.cat >= 60) factors.push('✅ Catalyst approaching');
   else if (sc.cat < 40) factors.push('⚠️ No near-term catalyst');
   if (sc.vol >= 50) factors.push('✅ Elevated fear — good for entries');
