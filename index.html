@@ -1060,6 +1060,7 @@ async function fetchHistoricalRSI(ticker = null) {
       if (!S.tickerData[t]) S.tickerData[t] = getTickerMeta(t);
       if (!S.tickerData[t]._live) S.tickerData[t]._live = {};
       S.tickerData[t]._live.rsi = Math.round(rsi * 10) / 10;
+      S.tickerData[t]._live.rsiSource = clean.length >= 200 ? 'db-200d' : 'db-partial';
       
       // SMAs from historical data
       if (clean.length >= 20) {
@@ -1097,6 +1098,59 @@ async function fetchHistoricalRSI(ticker = null) {
       // ATL from data if not set
       if (!S.tickerData[t].atl || S.tickerData[t].atl === 0) {
         S.tickerData[t].atl = Math.min(...clean);
+      }
+    } catch (e) { continue; }
+  }
+  updateNumbers();
+}
+
+// Alpha Vantage real indicators (25 calls/day — use sparingly, once on load)
+async function fetchAlphaVantageIndicators() {
+  const tickers = S.tickers.slice(0, 5); // Max 5 to conserve API calls
+  
+  for (const t of tickers) {
+    try {
+      // Fetch RSI(14) — real calculation from Alpha Vantage
+      const rsiData = await fetch(`/api/indicators?symbol=${t}&indicator=RSI&period=14`, { signal: AbortSignal.timeout(10000) });
+      if (rsiData.ok) {
+        const d = await rsiData.json();
+        const key = 'Technical Analysis: RSI';
+        if (d[key]) {
+          const dates = Object.keys(d[key]).sort().reverse();
+          if (dates.length) {
+            const realRsi = parseFloat(d[key][dates[0]].RSI);
+            if (!S.tickerData[t]) S.tickerData[t] = getTickerMeta(t);
+            if (!S.tickerData[t]._live) S.tickerData[t]._live = {};
+            S.tickerData[t]._live.rsi = Math.round(realRsi * 10) / 10;
+            S.tickerData[t]._live.rsiSource = 'alpha-vantage';
+          }
+        }
+      }
+      
+      // Fetch SMA200 — real calculation
+      const smaData = await fetch(`/api/indicators?symbol=${t}&indicator=SMA&period=200`, { signal: AbortSignal.timeout(10000) });
+      if (smaData.ok) {
+        const d = await smaData.json();
+        const key = 'Technical Analysis: SMA';
+        if (d[key]) {
+          const dates = Object.keys(d[key]).sort().reverse();
+          if (dates.length) {
+            S.tickerData[t].sma200 = parseFloat(d[key][dates[0]].SMA);
+          }
+        }
+      }
+      
+      // Fetch SMA50
+      const sma50Data = await fetch(`/api/indicators?symbol=${t}&indicator=SMA&period=50`, { signal: AbortSignal.timeout(10000) });
+      if (sma50Data.ok) {
+        const d = await sma50Data.json();
+        const key = 'Technical Analysis: SMA';
+        if (d[key]) {
+          const dates = Object.keys(d[key]).sort().reverse();
+          if (dates.length) {
+            S.tickerData[t].sma50 = parseFloat(d[key][dates[0]].SMA);
+          }
+        }
       }
     } catch (e) { continue; }
   }
@@ -2318,7 +2372,10 @@ async function init() {
   // Initial data fetch
   pollFinnhub();
   fetchFearGreed();
-  fetchHistoricalRSI();
+  fetchHistoricalRSI().then(() => {
+    // After DB data loads, overlay with Alpha Vantage real indicators (more accurate)
+    fetchAlphaVantageIndicators();
+  });
   fetchOptionsData();
   fetchNewsSentiment();
   
