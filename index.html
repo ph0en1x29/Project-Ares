@@ -530,7 +530,13 @@ function techScore(price, m, ticker) {
   // Beta adjustment (higher beta = more volatile = higher potential)
   if (m.beta > 1.5) s += 5;
   
-  return { score: Math.min(s, 100), rsi };
+  // Volume confirmation (from our historical DB)
+  const volRatio = m._live?.volumeRatio || 1;
+  if (volRatio > 1.5 && rsi <= 40) s += 10;  // High volume + oversold = capitulation (bullish)
+  else if (volRatio > 1.5 && rsi >= 60) s -= 5; // High volume + overbought = distribution (bearish)
+  else if (volRatio < 0.5) s -= 3; // Low volume = weak conviction either way
+  
+  return { score: Math.min(Math.max(s, 0), 100), rsi };
 }
 
 function valScore(price, m) {
@@ -1006,16 +1012,36 @@ async function fetchHistoricalRSI(ticker = null) {
   
   for (const t of tickers) {
     try {
-      const end = Math.floor(Date.now() / 1000);
-      const start = end - (90 * 86400);
-      const url = `https://corsproxy.io/?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${t}?period1=${start}&period2=${end}&interval=1d`)}`;
-      const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      if (!r.ok) continue;
-      const d = await r.json();
-      const closes = d?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
-      if (!closes || closes.length < 15) continue;
+      // PRIMARY: Fetch from our Supabase historical DB (200+ days, reliable)
+      let clean = [], volumes = [];
+      if (S.supabase) {
+        const { data } = await S.supabase.select('daily_prices', `ticker=eq.${t}&order=date.asc&limit=250`);
+        if (data?.length > 15) {
+          clean = data.map(d => parseFloat(d.close));
+          volumes = data.map(d => parseInt(d.volume) || 0);
+        }
+      }
       
-      const clean = closes.filter(c => c != null);
+      // FALLBACK: Yahoo via CORS proxy (for new tickers not in our DB)
+      if (clean.length < 15) {
+        const end = Math.floor(Date.now() / 1000);
+        const start = end - (90 * 86400);
+        const url = `https://corsproxy.io/?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${t}?period1=${start}&period2=${end}&interval=1d`)}`;
+        const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (r.ok) {
+          const d = await r.json();
+          const rawCloses = d?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+          const rawVols = d?.chart?.result?.[0]?.indicators?.quote?.[0]?.volume;
+          if (rawCloses?.length > 15) {
+            clean = rawCloses.filter(c => c != null);
+            volumes = rawVols ? rawVols.filter(v => v != null) : [];
+          }
+        }
+      }
+      
+      if (clean.length < 15) continue;
+      
+      // RSI(14)
       let gains = 0, losses = 0;
       for (let i = 1; i <= 14 && i < clean.length; i++) {
         const diff = clean[i] - clean[i - 1];
@@ -1035,16 +1061,17 @@ async function fetchHistoricalRSI(ticker = null) {
       if (!S.tickerData[t]._live) S.tickerData[t]._live = {};
       S.tickerData[t]._live.rsi = Math.round(rsi * 10) / 10;
       
-      // SMA from historical data
+      // SMAs from historical data
       if (clean.length >= 20) {
         S.tickerData[t].sma20 = Math.round(clean.slice(-20).reduce((a, b) => a + b, 0) / 20 * 100) / 100;
       }
       if (clean.length >= 50) {
         S.tickerData[t].sma50 = Math.round(clean.slice(-50).reduce((a, b) => a + b, 0) / 50 * 100) / 100;
       }
-      // SMA200 — only if we have enough data (we fetch 90 days, so estimate)
-      if (clean.length >= 60) {
-        // Use available data as best approximation
+      // REAL SMA200 — now possible with 200+ days in our DB!
+      if (clean.length >= 200) {
+        S.tickerData[t].sma200 = Math.round(clean.slice(-200).reduce((a, b) => a + b, 0) / 200 * 100) / 100;
+      } else if (clean.length >= 60) {
         S.tickerData[t].sma200 = S.tickerData[t].sma200 || Math.round(clean.reduce((a, b) => a + b, 0) / clean.length * 100) / 100;
       }
       
@@ -1058,6 +1085,14 @@ async function fetchHistoricalRSI(ticker = null) {
       
       // Spark data — last 30 closes for sparkline
       S.tickerData[t].sparkData = clean.slice(-30);
+      
+      // Volume analysis
+      if (volumes.length >= 20) {
+        const avgVol20 = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+        const todayVol = volumes[volumes.length - 1];
+        S.tickerData[t]._live.avgVolume20 = Math.round(avgVol20);
+        S.tickerData[t]._live.volumeRatio = avgVol20 > 0 ? Math.round((todayVol / avgVol20) * 100) / 100 : 1;
+      }
       
       // ATL from data if not set
       if (!S.tickerData[t].atl || S.tickerData[t].atl === 0) {
@@ -1076,6 +1111,57 @@ async function fetchFearGreed() {
       S.market.fearGreed = parseInt(d.data[0].value);
     }
   } catch (e) { }
+}
+
+// ══════════════════════════════════════════════════
+//  NEWS SENTIMENT (Finnhub company-news)
+// ══════════════════════════════════════════════════
+const BULLISH_WORDS = ['beat','surge','rally','upgrade','raise','buy','bullish','outperform','record','growth','strong','profit','soar','breakout','momentum'];
+const BEARISH_WORDS = ['miss','crash','sell','downgrade','cut','bearish','underperform','decline','loss','weak','warning','risk','plunge','layoff','recall'];
+
+async function fetchNewsSentiment() {
+  for (const t of S.tickers) {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+      const data = await fhGet(`/company-news?symbol=${t}&from=${weekAgo}&to=${today}`);
+      if (!data?.length) continue;
+      
+      // Score headlines
+      let totalScore = 0;
+      const headlines = data.slice(0, 20); // Last 20 articles
+      for (const article of headlines) {
+        const text = (article.headline || '').toLowerCase();
+        let score = 0;
+        for (const w of BULLISH_WORDS) { if (text.includes(w)) score += 1; }
+        for (const w of BEARISH_WORDS) { if (text.includes(w)) score -= 1; }
+        totalScore += score;
+      }
+      
+      // Normalize to 0-100 scale (50 = neutral)
+      const normalized = Math.min(100, Math.max(0, 50 + (totalScore / headlines.length) * 25));
+      
+      if (!S.tickerData[t]) S.tickerData[t] = getTickerMeta(t);
+      S.tickerData[t].sentiment = Math.round(normalized);
+      S.tickerData[t]._live.newsCount = headlines.length;
+      S.tickerData[t]._live.newsSentiment = Math.round(normalized);
+      S.tickerData[t]._live.latestHeadline = headlines[0]?.headline || '';
+      
+      // Save to Supabase for tracking
+      if (S.supabase && headlines.length) {
+        const rows = headlines.slice(0, 5).map(h => ({
+          ticker: t,
+          headline: h.headline,
+          source: h.source,
+          url: h.url,
+          sentiment_score: 0,
+          published_at: new Date(h.datetime * 1000).toISOString()
+        }));
+        S.supabase.query('news_sentiment', 'POST', rows);
+      }
+    } catch (e) { continue; }
+  }
+  updateNumbers();
 }
 
 // ══════════════════════════════════════════════════
@@ -2056,6 +2142,9 @@ function updateDetailNumbers() {
     { l: 'ROC 5d', v: m.roc5 ? `${m.roc5 >= 0 ? '+' : ''}${m.roc5.toFixed(2)}%` : '—', w: m.roc5 < -5 },
     { l: 'ROC 20d', v: m.roc20 ? `${m.roc20 >= 0 ? '+' : ''}${m.roc20.toFixed(2)}%` : '—', w: m.roc20 < -10 },
     { l: 'Trend', v: sc.trend.label },
+    { l: 'Vol Ratio', v: m._live?.volumeRatio ? `${m._live.volumeRatio.toFixed(2)}x avg` : '—', w: m._live?.volumeRatio > 2 },
+    { l: 'Avg Vol 20d', v: m._live?.avgVolume20 ? (m._live.avgVolume20 / 1e6).toFixed(1) + 'M' : '—' },
+    { l: 'News Sent.', v: m._live?.newsSentiment ? `${m._live.newsSentiment} (${m._live.newsSentiment > 55 ? 'Bullish' : m._live.newsSentiment < 45 ? 'Bearish' : 'Neutral'})` : '—', w: m._live?.newsSentiment < 40 },
     { l: 'Source', v: p.source === 'finnhub-ws' ? '⚡ Real-time' : '📊 REST' },
   ];
   
@@ -2231,12 +2320,14 @@ async function init() {
   fetchFearGreed();
   fetchHistoricalRSI();
   fetchOptionsData();
+  fetchNewsSentiment();
   
   // Polling intervals
   setInterval(pollFinnhub, POLL_MS);
   setInterval(fetchFearGreed, 300000);
   setInterval(fetchHistoricalRSI, 600000);
   setInterval(fetchOptionsData, 900000);
+  setInterval(fetchNewsSentiment, 1800000); // News every 30 min
   
   // Countdown timer
   setInterval(() => {
