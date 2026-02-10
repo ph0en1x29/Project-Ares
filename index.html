@@ -325,56 +325,88 @@ function sig(comp) {
 }
 
 // ══════════════════════════════════════════════════
-//  DATA FETCHING
+//  DATA FETCHING (Finnhub REST API)
 // ══════════════════════════════════════════════════
-async function pollYahoo() {
-  const allSyms = [...TICKERS,'^VIX','^GSPC','^IXIC'].join(',');
-  const urls = [
-    `https://corsproxy.io/?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${allSyms}`)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${allSyms}`)}`,
-  ];
-  for(const url of urls) {
+async function fhGet(endpoint) {
+  const key = S.apiKey || localStorage.getItem('finnhub_key') || '';
+  if(!key) return null;
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1${endpoint}${endpoint.includes('?')?'&':'?'}token=${key}`, {signal:AbortSignal.timeout(8000)});
+    if(!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+async function pollFinnhub() {
+  // Snapshot previous prices
+  for(const t of TICKERS) {
+    if(S.prices[t]?.price) S.prevSnapshot[t] = S.prices[t].price;
+  }
+
+  // Fetch all ticker quotes in parallel
+  const quotePromises = [...TICKERS, 'SPY', 'QQQ', 'VIXY'].map(sym =>
+    fhGet(`/quote?symbol=${sym}`).then(d => d ? {sym, ...d} : null)
+  );
+  const results = await Promise.all(quotePromises);
+
+  for(const q of results) {
+    if(!q || !q.c) continue;
+    const sym = q.sym;
+
+    if(TICKERS.includes(sym)) {
+      const existing = S.prices[sym] || {};
+      const wsAge = existing?.lastTrade ? (Date.now() - existing.lastTrade) : 999999;
+      // Only overwrite if WS data is stale (>30s)
+      if(wsAge > 30000) {
+        S.prices[sym] = { ...existing, price:q.c, prevClose:q.pc, high:q.h, low:q.l, open:q.o, source:'finnhub-rest' };
+      } else {
+        // Keep WS price, but update day stats
+        S.prices[sym] = { ...existing, prevClose:q.pc, high:Math.max(q.h||0,existing.high||0),
+          low:Math.min(q.l||999999,existing.low||999999), open:q.o };
+      }
+    }
+
+    // Market indices via ETF proxies
+    if(sym==='VIXY') { S.market.vix=q.c; S.market.vixPrev=q.pc; }
+    if(sym==='SPY') { S.market.sp500=q.c; S.market.sp500Prev=q.pc; }
+    if(sym==='QQQ') { S.market.ndx=q.c; S.market.ndxPrev=q.pc; }
+  }
+
+  S.lastPoll = new Date();
+  S.refreshCount++;
+  S.countdown = 60;
+  updateNumbers();
+}
+
+// Fetch put/call ratio from options chain
+async function fetchOptionsData() {
+  for(const ticker of TICKERS) {
     try {
-      const r = await fetch(url, {signal:AbortSignal.timeout(10000)});
-      if(!r.ok) continue;
-      const d = await r.json();
-      const results = d?.quoteResponse?.result;
-      if(!results) continue;
+      const d = await fhGet(`/stock/option-chain?symbol=${ticker}`);
+      if(!d?.data?.length) continue;
+      // Use nearest expiry
+      const nearest = d.data[0];
+      const calls = nearest.options?.CALL || [];
+      const puts = nearest.options?.PUT || [];
+      const totalCallOI = calls.reduce((a,o) => a + (o.openInterest||0), 0);
+      const totalPutOI = puts.reduce((a,o) => a + (o.openInterest||0), 0);
+      const pcRatio = totalCallOI > 0 ? (totalPutOI / totalCallOI).toFixed(2) : null;
+      const totalCallVol = calls.reduce((a,o) => a + (o.volume||0), 0);
+      const totalPutVol = puts.reduce((a,o) => a + (o.volume||0), 0);
 
-      // Snapshot previous prices for tick direction
-      for(const t of TICKERS) {
-        if(S.prices[t]?.price) S.prevSnapshot[t] = S.prices[t].price;
-      }
-
-      for(const q of results) {
-        const sym=q.symbol;
-        if(TICKERS.includes(sym)) {
-          const existing = S.prices[sym];
-          const wsAge = existing?.lastTrade ? (Date.now()-existing.lastTrade) : 999999;
-          if(wsAge > 30000) {
-            S.prices[sym] = { ...existing, price:q.regularMarketPrice, prevClose:q.regularMarketPreviousClose,
-              high:q.regularMarketDayHigh, low:q.regularMarketDayLow, volume:q.regularMarketVolume,
-              marketCap:q.marketCap, pe:q.trailingPE, source:'yahoo' };
-          } else {
-            S.prices[sym] = { ...existing, prevClose:q.regularMarketPreviousClose||existing?.prevClose,
-              high:Math.max(q.regularMarketDayHigh||0,existing?.high||0),
-              low:Math.min(q.regularMarketDayLow||999999,existing?.low||999999),
-              volume:q.regularMarketVolume, marketCap:q.marketCap, pe:q.trailingPE };
-          }
-        }
-        if(sym==='^VIX') { S.market.vix=q.regularMarketPrice; S.market.vixPrev=q.regularMarketPreviousClose; }
-        if(sym==='^GSPC') { S.market.sp500=q.regularMarketPrice; S.market.sp500Prev=q.regularMarketPreviousClose; }
-        if(sym==='^IXIC') { S.market.ndx=q.regularMarketPrice; S.market.ndxPrev=q.regularMarketPreviousClose; }
-      }
-
-      S.lastPoll = new Date();
-      S.refreshCount++;
-      S.countdown = 60;
-      updateNumbers();
-      return;
+      if(!META[ticker]._live) META[ticker]._live = {};
+      META[ticker]._live.pcRatio = pcRatio ? parseFloat(pcRatio) : null;
+      META[ticker]._live.callOI = totalCallOI;
+      META[ticker]._live.putOI = totalPutOI;
+      META[ticker]._live.callVol = totalCallVol;
+      META[ticker]._live.putVol = totalPutVol;
     } catch(e) { continue; }
   }
+  updateNumbers();
 }
+
+// Alias for backward compat
+const pollYahoo = pollFinnhub;
 
 function connectWS() {
   if(!S.apiKey) return;
@@ -442,11 +474,11 @@ function buildStructure() {
   // Header
   html += `<div class="header">
     <div class="header-left">
-      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v2.1</div>
+      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v3.0</div>
       <h1 class="mono">Tech Scoring Engine</h1>
       <div class="status-row mono" id="status-row">
         <span class="dot ${S.wsConnected?'ws':S.lastPoll?'live':'off'}" id="status-dot"></span>
-        <span id="status-label">${S.wsConnected?'REAL-TIME (Finnhub WS)':S.lastPoll?'POLLING (~15min delay)':'CONNECTING...'}</span>
+        <span id="status-label">${S.wsConnected?'REAL-TIME (Finnhub WS)':S.lastPoll?'FINNHUB REST':'CONNECTING...'}</span>
         <span>•</span>
         <span id="status-time">${S.lastPoll?S.lastPoll.toLocaleTimeString():'—'}</span>
         <span id="status-ws">${S.wsLast?'• WS: '+S.wsLast.toLocaleTimeString():''}</span>
@@ -478,9 +510,9 @@ function buildStructure() {
 
   // Market bar
   html += `<div class="market-row">
-    <div class="market-chip"><div class="mono lbl">VIX</div><div class="mono val" id="mkt-vix">—</div><div class="mono chg" id="mkt-vix-chg">—</div></div>
-    <div class="market-chip"><div class="mono lbl">S&P 500</div><div class="mono val" id="mkt-sp">—</div><div class="mono chg" id="mkt-sp-chg">—</div></div>
-    <div class="market-chip"><div class="mono lbl">NASDAQ</div><div class="mono val" id="mkt-ndx">—</div><div class="mono chg" id="mkt-ndx-chg">—</div></div>
+    <div class="market-chip"><div class="mono lbl">VIXY (VIX)</div><div class="mono val" id="mkt-vix">—</div><div class="mono chg" id="mkt-vix-chg">—</div></div>
+    <div class="market-chip"><div class="mono lbl">SPY (S&P)</div><div class="mono val" id="mkt-sp">—</div><div class="mono chg" id="mkt-sp-chg">—</div></div>
+    <div class="market-chip"><div class="mono lbl">QQQ (NDX)</div><div class="mono val" id="mkt-ndx">—</div><div class="mono chg" id="mkt-ndx-chg">—</div></div>
     <div class="market-chip"><div class="mono lbl">FEAR / GREED</div><div class="mono val" id="mkt-fg">—</div><div class="mono chg" id="mkt-fg-lbl" style="color:var(--text-3)">—</div></div>
   </div>`;
 
@@ -561,8 +593,8 @@ function buildStructure() {
 
   // Footer
   html += `<div class="footer mono">
-    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v2.1</span> •
-    ${S.wsConnected?'Real-time via Finnhub WebSocket':'Yahoo Finance polling (15-20min delay)'} •
+    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v3.0</span> •
+    ${S.wsConnected?'Real-time via Finnhub WebSocket':'Finnhub REST polling'} •
     Live RSI(14) • Live Fear/Greed Index • Scores update on every price tick<br>
     <strong>TECH</strong>: RSI(14) from historical data, SMA50 (live), SMA200, support •
     <strong>VALUE</strong>: ATH drawdown, PEG, analyst upside •
@@ -719,7 +751,10 @@ function updateDetailNumbers() {
     {l:'PEG',v:m.pegRatio,w:m.pegRatio<0.5},
     {l:'Target',v:`$${m.analystTarget} (+${up}%)`},
     {l:'Earnings',v:`${sc.dte}d`,w:sc.dte>=10&&sc.dte<=25},
-    {l:'Source',v:p.source==='finnhub-ws'?'⚡ Real-time':'📊 Yahoo'},
+    {l:'P/C Ratio',v:m._live?.pcRatio!=null?m._live.pcRatio.toFixed(2):'—',w:m._live?.pcRatio>1.2},
+    {l:'Call OI',v:m._live?.callOI!=null?m._live.callOI.toLocaleString():'—'},
+    {l:'Put OI',v:m._live?.putOI!=null?m._live.putOI.toLocaleString():'—'},
+    {l:'Source',v:p.source==='finnhub-ws'?'⚡ Real-time':'📊 Finnhub REST'},
     {l:'DCA',v:`${m.allocation}%`},
   ];
   const mg = document.getElementById('detail-metrics');
@@ -760,7 +795,7 @@ function updateStatus() {
   const dot = document.getElementById('status-dot');
   if(dot) { dot.className = 'dot '+(S.wsConnected?'ws':S.lastPoll?'live':'off'); }
   const lbl = document.getElementById('status-label');
-  if(lbl) lbl.textContent = S.wsConnected?'REAL-TIME (Finnhub WS)':S.lastPoll?'POLLING (~15min delay)':'CONNECTING...';
+  if(lbl) lbl.textContent = S.wsConnected?'REAL-TIME (Finnhub WS)':S.lastPoll?'FINNHUB REST':'CONNECTING...';
 }
 
 // ── DOM helpers ──
@@ -891,11 +926,13 @@ if(S.apiKey) {
 pollYahoo();
 fetchFearGreed();
 fetchHistoricalRSI();
+fetchOptionsData();
 
 // Poll loop
 setInterval(pollYahoo, POLL_MS);
 setInterval(fetchFearGreed, 300000); // Fear/Greed every 5 min
 setInterval(fetchHistoricalRSI, 600000); // RSI refresh every 10 min
+setInterval(fetchOptionsData, 900000); // Options data every 15 min
 
 // Countdown (just updates the number, no DOM rebuild)
 setInterval(() => {
