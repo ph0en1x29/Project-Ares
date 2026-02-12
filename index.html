@@ -309,7 +309,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:12px;
 
 <script>
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROJECT ARES v11 — FULL TRADING PLATFORM
+//  PROJECT ARES v12.1 — FULL TRADING PLATFORM
 //  Phase 1: Dynamic Search + Scoring
 //  Phase 2: Supabase Integration
 //  Phase 3: Paper Trading
@@ -1663,9 +1663,41 @@ function autoTradeEntry() {
       // Skip within 7 days of earnings
       if (sc.dte != null && sc.dte >= 0 && sc.dte <= 7) continue;
       
+      // ═══ v12.1 MACRO OVERLAY ═══
+      let macroMult = 1.0;
+      const vix = S.market.vix || 0;
+      const vixPrev = S.market.vixPrev || 0;
+      
+      // 1. VIX Regime Filter
+      if (vix >= 30) {
+        // Crisis — block unless VIX is declining (mean reversion)
+        if (vixPrev && vix < vixPrev) { macroMult *= 0.5; }
+        else { console.log(`🛡️ v12.1 BLOCKED ${ticker}: VIX crisis (${vix.toFixed(1)})`); continue; }
+      } else if (vix >= 25) {
+        macroMult *= 0.5; // Elevated — half size
+      }
+      
+      // 2. Event Calendar Block (CPI + FOMC)
+      const today = new Date();
+      const mm = today.getMonth() + 1, dd = today.getDate();
+      const CPI_2026 = [[2,13],[3,13],[4,10],[5,15],[6,12],[7,10],[8,14],[9,11],[10,16],[11,13],[12,11]];
+      const FOMC_2026 = [[3,18],[5,6],[6,17],[7,29],[9,16],[10,28],[12,9]];
+      const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
+      const tm = tomorrow.getMonth() + 1, td2 = tomorrow.getDate();
+      const isEventDay = [...CPI_2026, ...FOMC_2026].some(([m,d]) => (mm===m && dd===d) || (tm===m && td2===d));
+      if (isEventDay) {
+        console.log(`🛡️ v12.1 BLOCKED ${ticker}: CPI/FOMC event window`);
+        continue;
+      }
+      
+      // 3. Contrarian Boost
+      if (vix >= 22 && vixPrev && vix < vixPrev) {
+        macroMult *= 1.2; // Declining from elevated = opportunity
+      }
+      
       // Position sizing by confluence
       const sizePct = strat.sizing[Math.min(conf.votes, 9)] || strat.sizing[6];
-      const positionValue = stratCapital * sizePct;
+      const positionValue = stratCapital * sizePct * macroMult;
       
       if (positionValue > S.portfolio.cash) continue;
       if (positionValue < 50) continue;
@@ -1937,7 +1969,7 @@ function buildStructure() {
   // ── HEADER ──
   html += `<div class="header">
     <div class="header-left">
-      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v11</div>
+      <div class="mono" style="font-size:9px;color:var(--blue);letter-spacing:2px;margin-bottom:3px">PROJECT ARES v12.1</div>
       <h1 class="mono">Entry Signal Engine</h1>
       <div class="status-row mono" id="status-row">
         <span class="dot ${S.wsConnected ? 'ws' : S.lastPoll ? 'live' : 'off'}" id="status-dot"></span>
@@ -2318,7 +2350,7 @@ function buildStructure() {
   
   // ── FOOTER ──
   html += `<div class="footer mono">
-    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v11</span> •
+    <span style="color:var(--blue);font-weight:700;letter-spacing:1px">MODEL v12.1</span> •
     ${S.wsConnected ? '⚡ LIVE — Finnhub WebSocket' : `🔄 POLLING every ${POLL_MS/1000}s`} •
     Live RSI(14) • Live Fear/Greed Index • Paper Trading • Supabase Integration<br>
     <strong>TECH</strong>: RSI(14), SMA50, SMA200, support/resistance •
